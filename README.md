@@ -4,14 +4,18 @@ Goal: run a Llama 2-architecture model (Karpathy's llama2.c TinyStories
 models, starting with stories15M) on a Digilent Genesys 2 board (Kintex-7
 `xc7k325tffg900-2`), using llama2.c's int8 "Q8_0" format.
 
-Current state:
+Current state: stories15M runs on the board with every matmul on the FPGA,
+and its output is bit-identical to llama2.c's `runq.c` on a CPU. The rest of
+the model still runs on the host PC (`host/llm_host.c`), which sends one
+matmul at a time over the USB-UART, so it is slow (0.7 tokens/s, set by USB
+round trips). Next: a MicroBlaze V soft CPU on the FPGA for the rest.
 
-- `top_qmv`: the int8 matrix-vector engine that token generation needs, fed
-  over the USB-UART. Every per-layer matmul of stories15M run on the board
-  matches llama2.c's `runq.c` bit-for-bit.
-- `top_gemm`: `Y = A @ B + C` on an N×N int8 systolic array (default N = 16),
-  also over the UART. The array is kept for prompt processing later, where
-  the work is a real matrix-matrix product.
+- `top_llm` (default): 1 GB DDR3 holds the weights; the int8 matrix-vector
+  engine streams them from DDR. The weights are stored on a microSD card in
+  the board's slot and loaded into DDR at power-on (~7 s).
+- `top_qmv`: the same engine with the weights sent over the UART (no DDR).
+- `top_gemm`: `Y = A @ B + C` on an N×N int8 systolic array, kept for
+  prompt processing later.
 
 ## Architecture
 
@@ -33,6 +37,22 @@ lays `W` out in that order: `qmv_stream()` in `ref/q80.py`.
 `top_qmv` protocol (1 Mbaud): the host sends `n`, `d` (u16), `x.q`, `x.s`,
 then the weight beats (32 int8 + float32 scale each); the FPGA streams back
 `d` float32 results as they are computed. See `src/sources/top_qmv.sv`.
+
+### `top_llm`: DDR3, commands, microSD
+
+- DDR3 controller (`mig_ddr3`, generated from Digilent's preset by
+  `scripts/gen_ip.tcl`): 1800 MT/s, 256-bit AXI at 225 MHz. Everything else
+  runs on its 225 MHz clock.
+- `llm_core.sv`: UART command interface at 3 Mbaud: STATUS, WRITE / READ
+  DDR, MATMUL (W streamed from DDR by `wstream_reader.sv`, x sent with the
+  command), SD_LOAD, SD_STORE.
+- `sd_ctrl.sv`: microSD in SPI mode. SD_STORE copies a DDR region to the card
+  (image, then a header with a checksum, written last); SD_LOAD copies it
+  back and checks it. SD_LOAD also runs by itself after power-on.
+
+Weights sit in DDR in "qmv DDR format": the engine's beat order in chunks of
+8 beats, each one beat of 8 float32 group scales and then the 8 weight
+beats.
 
 ### Systolic array (`systolic_array.sv`)
 
@@ -98,7 +118,8 @@ python3 ref/check_ref.py         # check the numpy reference against it
 ## Simulation (Verilator)
 
 ```sh
-sim/run_qmv.sh                          # matmul engine (needs ref/build_ref.sh)
+sim/run_qmv.sh                          # engine + top_llm core (needs ref/build_ref.sh)
+sim/run_tb.sh tb_sd_ctrl sdhc -GSdhc=1  # microSD controller (also -GSdhc=0)
 sim/run_verilator.sh 2 4 16             # systolic array alone
 TB=tb_top_gemm sim/run_verilator.sh 2 4 16   # top_gemm through the UART pins
 ```
@@ -111,6 +132,15 @@ TB=tb_top_gemm sim/run_verilator.sh 2 4 16   # top_gemm through the UART pins
    32000-row classifier) plus a random group-size-64 one, every output
    checked bit-exact, with random stalls in the weight stream
 3. `tb_top_qmv`: `top_qmv` through its UART pins, including the idle timeout
+4. `tb_llm_core`: `top_llm`'s logic (everything but the DDR controller)
+   against an AXI memory model and an SD card model: every command, real
+   matmuls from "DDR", an SD store / load round trip
+
+`src/sim/` also has the models: `axi_mem_model.sv` (AXI4 memory with random
+stalls) and `sd_card_model.sv` (SPI-mode SDHC / SDSC card with random
+delays, which also flags protocol violations). `sim/fake_board.py` is the
+whole command set in software on a pseudo-terminal, for testing host
+programs without the board.
 
 `run_verilator.sh` regenerates the GEMM vectors with `sim/gen_stim.py` (`iden`:
 `A` = identity, `C` = 0, so `Y = B`; `rand`: all random) and runs the chosen
@@ -123,8 +153,8 @@ to keep the sims short.
 ```sh
 source /tools/Xilinx/2026.1/Vivado/settings64.sh
 
-make                 # top_qmv: synth -> impl -> bitstream
-make TOP=top_gemm    # the GEMM design instead
+make                 # top_llm: DDR controller IP (first time), synth -> impl -> bitstream
+make TOP=top_qmv     # or top_gemm
 make impl            # stop after place and route
 make synth           # stop after synthesis
 make program         # load the bitstream over the JTAG USB port (not to flash)
@@ -132,20 +162,31 @@ make program         # load the bitstream over the JTAG USB port (not to flash)
 
 Each stage reruns only when its inputs have changed. Output goes to
 `build/<TOP>/`: checkpoints, logs, and the utilization and timing reports.
-Both designs meet timing at 200 MHz.
+`top_llm` meets timing at 225 MHz, the others at 200 MHz.
 
 ## Running on the board
 
-Plug in both micro-USB ports: **PROG** (JTAG) and **UART**. Then:
+Plug in both micro-USB ports: **PROG** (JTAG) and **UART**. Your user needs
+to be in the `dialout` group.
 
 ```sh
 make program
-python3 host/qmv_uart.py                 # layer 0 matmuls; or pass dump indices
-make TOP=top_gemm program
-python3 host/gemm_uart.py --n 16
+host/build_host.sh                       # once (needs ref/build_ref.sh)
+
+# first time, or for a new model: upload the weights (~1 min) and store
+# them on the microSD card (~7 s); this overwrites the card
+ref/build/llm_host models/stories15M_q80.bin third_party/llama2.c/tokenizer.bin \
+    "Once upon a time" 64 ref/build/run -u -s
+
+# afterwards the board loads them from the card at power-on, and llm_host
+# skips the upload; -v also checks every matmul against the CPU
+ref/build/llm_host models/stories15M_q80.bin third_party/llama2.c/tokenizer.bin \
+    "Once upon a time" 64 ref/build/run -v
+cmp ref/build/run/logits.bin ref/build/stories15M/logits.bin   # identical
+
+python3 host/sd_tool.py status           # SD / DDR status
+python3 host/ddr_test.py                 # DDR memory test + matmuls from DDR
 ```
 
-If `make program` reports "No devices detected" although the board is on,
-power-cycle the board. If the UART shows up under another name than
-`/dev/ttyUSB0`, check `dmesg` after plugging it in. Your user needs to be in
-the `dialout` group.
+`top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
+`host/gemm_uart.py`.
