@@ -1,10 +1,7 @@
 ## Genesys 2 (Rev. H) constraints for this design. Pin assignments are copied
 ## from board_support/digilent-xdc/Genesys-2-Master.xdc, which lists every pin.
-
-## 200 MHz system clock
-set_property -dict { PACKAGE_PIN AD11  IOSTANDARD LVDS     } [get_ports { sysclk_n }]; #IO_L12N_T1_MRCC_33 Sch=sysclk_n
-set_property -dict { PACKAGE_PIN AD12  IOSTANDARD LVDS     } [get_ports { sysclk_p }]; #IO_L12P_T1_MRCC_33 Sch=sysclk_p
-create_clock -period 5.000 -name sysclk [get_ports sysclk_p]
+## The 200 MHz board clock is in sysclk.xdc (designs without the DDR
+## controller); top_llm's DDR controller constrains it and the DDR3 pins itself.
 
 ## CPU reset button (active low)
 set_property -dict { PACKAGE_PIN R19   IOSTANDARD LVCMOS33 } [get_ports { cpu_resetn }]; #IO_0_14 Sch=cpu_resetn

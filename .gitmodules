@@ -4,3 +4,6 @@
 [submodule "board_support/digilent-xdc"]
 	path = board_support/digilent-xdc
 	url = git@github.com:Digilent/digilent-xdc.git
+[submodule "third_party/llama2.c"]
+	path = third_party/llama2.c
+	url = https://github.com/karpathy/llama2.c.git

@@ -71,3 +71,11 @@ sim/build/
 .vscode
 CLAUDE*.md
 .venv
+## model weights and generated reference data
+/models/
+/ref/build/
+
+## Vivado writes this into the working directory on every implementation run
+clockInfo.txt
+tight_setup_hold_pins.txt
+__pycache__/

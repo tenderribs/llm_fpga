@@ -1,24 +1,72 @@
 # LLM on FPGA
 
-Goal: run a Llama 2-architecture model on a Digilent Genesys 2 board
-(Kintex-7 `xc7k325tffg900-2`), built up from a hand-written int8 GEMM engine.
+Goal: run a Llama 2-architecture model (Karpathy's llama2.c TinyStories
+models, starting with stories15M) on a Digilent Genesys 2 board (Kintex-7
+`xc7k325tffg900-2`), using llama2.c's int8 "Q8_0" format.
 
-Current state: `Y = A @ B + C` on an N×N systolic array (default N = 16), fed
-over the board's USB-UART from a host script. `A`, `B` and `C` are signed
-8-bit, `Y` is signed 32-bit.
+Current state: stories15M runs on the board with every matmul on the FPGA,
+and its output is bit-identical to llama2.c's `runq.c` on a CPU. The rest of
+the model still runs on the host PC (`host/llm_host.c`), which sends one
+matmul at a time over the USB-UART, so it is slow (0.7 tokens/s, set by USB
+round trips). Next: a MicroBlaze V soft CPU on the FPGA for the rest.
+
+- `top_llm` (default): 1 GB DDR3 holds the weights; the int8 matrix-vector
+  engine streams them from DDR. The weights are stored on a microSD card in
+  the board's slot and loaded into DDR at power-on (~7 s).
+- `top_qmv`: the same engine with the weights sent over the UART (no DDR).
+- `top_gemm`: `Y = A @ B + C` on an N×N int8 systolic array, kept for
+  prompt processing later.
 
 ## Architecture
 
-The core is a weight-stationary systolic array of N×N processing elements (PEs). `B` is loaded into the PEs first and stays there. Then `A` flows in from the left and partial sums flow down from the top, starting at `C`. Rows of `Y` come out at the bottom, one per cycle.
+### Quantized matrix-vector engine (`qmv.sv`)
 
-`top` wraps the array with a UART receiver and transmitter. The host sends
-`A`, `B`, `C` (N·N bytes each, row-major); the FPGA computes and sends back `Y`
-(N·N little-endian int32, row-major). If the host stops partway through a job
-for 100 ms, the partial job is dropped, so a crashed host script can't leave the
-board out of step.
+Computes `y = W @ x` exactly as `runq.c`'s `matmul()` does: for each row, per
+group of 32 (or 64) inputs, an int32 dot product of int8 values, then
+`val += ((float)ival * w_scale) * x_scale` in float32, in group order. The
+float units (`fp32_mul`, `fp32_add`, `int_to_fp32`) round to nearest even
+like the CPU, which is what makes the results bit-exact. They flush
+subnormals to zero, a range these values never reach.
 
-LEDs: 0 heartbeat, 1 receiving, 2 computing, 3 sending, 7:4 completed jobs
-(mod 16). The CPU RESET button resets the design.
+`x` sits in on-chip RAM; `W` streams in at 32 bytes per beat (the DDR3
+interface width, for later) with each beat's group scale. Each row's float
+sum is a chain of dependent adds, so the engine works on 16 rows
+round-robin to hide the adder pipeline and takes a beat every cycle. The host
+lays `W` out in that order: `qmv_stream()` in `ref/q80.py`.
+
+`top_qmv` protocol (1 Mbaud): the host sends `n`, `d` (u16), `x.q`, `x.s`,
+then the weight beats (32 int8 + float32 scale each); the FPGA streams back
+`d` float32 results as they are computed. See `src/sources/top_qmv.sv`.
+
+### `top_llm`: DDR3, commands, microSD
+
+- DDR3 controller (`mig_ddr3`, generated from Digilent's preset by
+  `scripts/gen_ip.tcl`): 1800 MT/s, 256-bit AXI at 225 MHz. Everything else
+  runs on its 225 MHz clock.
+- `llm_core.sv`: UART command interface at 3 Mbaud: STATUS, WRITE / READ
+  DDR, MATMUL (W streamed from DDR by `wstream_reader.sv`, x sent with the
+  command), SD_LOAD, SD_STORE.
+- `sd_ctrl.sv`: microSD in SPI mode. SD_STORE copies a DDR region to the card
+  (image, then a header with a checksum, written last); SD_LOAD copies it
+  back and checks it. SD_LOAD also runs by itself after power-on.
+
+Weights sit in DDR in "qmv DDR format": the engine's beat order in chunks of
+8 beats, each one beat of 8 float32 group scales and then the 8 weight
+beats.
+
+### Systolic array (`systolic_array.sv`)
+
+A weight-stationary systolic array of N×N processing elements (PEs). `B` is loaded into the PEs first and stays there. Then `A` flows in from the left and partial sums flow down from the top, starting at `C`. Rows of `Y` come out at the bottom, one per cycle.
+
+`top_gemm` protocol (115200 baud): the host sends `A`, `B`, `C` (N·N bytes
+each, row-major); the FPGA sends back `Y` (N·N little-endian int32,
+row-major).
+
+### Both tops
+
+If the host stops partway through a job for 100 ms, the job is dropped, so a
+crashed host script can't leave the board out of step. LEDs: 0 heartbeat,
+1-3 job phase, 7:4 completed jobs (mod 16). CPU RESET resets the design.
 
 ## Required software
 
@@ -44,46 +92,101 @@ pip install -r requirements.txt
 
 `board_support/` holds Digilent's board files and master XDC as submodules.
 The constraints this design uses are in `src/constrs/genesys2.xdc`.
+`third_party/llama2.c` is Karpathy's llama2.c, used as the golden reference.
+
+## Golden reference (`ref/`)
+
+```sh
+mkdir -p models && curl -L -o models/stories15M.bin \
+  https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+ref/build_ref.sh                 # quantize, build runq_dump, dump golden data
+python3 ref/check_ref.py         # check the numpy reference against it
+```
+
+- `export_q80.py`: numpy port of llama2.c's Q8_0 export (no PyTorch needed);
+  writes `models/stories15M_q80.bin` (group size 32, since 288 isn't a
+  multiple of 64).
+- `runq_dump.c`: runs `runq.c` greedily and dumps the logits of every step
+  plus every `matmul()` call at one position (43 for stories15M: 6 layers ×
+  7, plus the classifier) to `ref/build/stories15M/`.
+- `q80.py`: numpy reference. `matmul()` and `quantize()` are bit-exact with
+  `runq.c`; `forward()` is close but not exact (numpy's float sums and
+  `exp`/`sqrt` differ by an ulp now and then, and once one tips an
+  activation across a rounding boundary the KV cache carries it), so
+  `runq.c` itself stays the full-model golden.
 
 ## Simulation (Verilator)
 
 ```sh
-sim/run_verilator.sh 2 4 16            # systolic array alone
-TB=tb_top sim/run_verilator.sh 2 4 16  # whole design, through the UART pins
+sim/run_qmv.sh                          # engine + top_llm core (needs ref/build_ref.sh)
+sim/run_tb.sh tb_sd_ctrl sdhc -GSdhc=1  # microSD controller (also -GSdhc=0)
+sim/run_verilator.sh 2 4 16             # systolic array alone
+TB=tb_top_gemm sim/run_verilator.sh 2 4 16   # top_gemm through the UART pins
 ```
 
-For each size the script regenerates the test vectors with `sim/gen_stim.py`,
-builds the testbench once per mode in `sim/build/verilator/<TB>/N<size>_<mode>/`,
-runs it and prints `TEST PASSED` / `MISMATCH` / `FAIL` / `TIMEOUT` lines.
+`run_qmv.sh` runs:
 
-The vector modes are `iden` (`A` = identity, `C` = 0, so `Y = B`) and `rand`.
-The seed is fixed, so the vectors are the same on every run.
+1. `tb_fp32`: the float units against numpy float32, on 60k vectors
+   including exact rounding ties (`sim/gen_qmv.py fp`)
+2. `tb_qmv`: the engine on real `runq.c` matmuls (layer 0 wq, w1, w2 and the
+   32000-row classifier) plus a random group-size-64 one, every output
+   checked bit-exact, with random stalls in the weight stream
+3. `tb_top_qmv`: `top_qmv` through its UART pins, including the idle timeout
+4. `tb_llm_core`: `top_llm`'s logic (everything but the DDR controller)
+   against an AXI memory model and an SD card model: every command, real
+   matmuls from "DDR", an SD store / load round trip
 
-`tb_top` runs the UART at 8 clocks per bit to keep the sim short. It first
-sends a few stray bytes to check the idle timeout, then two full jobs.
+`src/sim/` also has the models: `axi_mem_model.sv` (AXI4 memory with random
+stalls) and `sd_card_model.sv` (SPI-mode SDHC / SDSC card with random
+delays, which also flags protocol violations). `sim/fake_board.py` is the
+whole command set in software on a pseudo-terminal, for testing host
+programs without the board.
+
+`run_verilator.sh` regenerates the GEMM vectors with `sim/gen_stim.py` (`iden`:
+`A` = identity, `C` = 0, so `Y = B`; `rand`: all random) and runs the chosen
+testbench per size. `sim/run_tb.sh <tb> <tag> [-G...]` builds and runs any
+single testbench. The top-level testbenches run the UART at 8 clocks per bit
+to keep the sims short.
 
 ## FPGA build (Vivado)
 
 ```sh
 source /tools/Xilinx/2026.1/Vivado/settings64.sh
 
-make            # synth -> impl -> bitstream (build/top.bit)
-make impl       # stop after place and route
-make synth      # stop after synthesis
-make program    # load build/top.bit over the JTAG USB port (not to flash)
+make                 # top_llm: DDR controller IP (first time), synth -> impl -> bitstream
+make TOP=top_qmv     # or top_gemm
+make impl            # stop after place and route
+make synth           # stop after synthesis
+make program         # load the bitstream over the JTAG USB port (not to flash)
 ```
 
-Each stage reruns only when its inputs have changed. All output goes to `build/`: checkpoints, logs, and the utilization and timing reports.
+Each stage reruns only when its inputs have changed. Output goes to
+`build/<TOP>/`: checkpoints, logs, and the utilization and timing reports.
+`top_llm` meets timing at 225 MHz, the others at 200 MHz.
 
 ## Running on the board
 
-Plug in both micro-USB ports: **JTAG** (programming) and **UART**. Then:
+Plug in both micro-USB ports: **PROG** (JTAG) and **UART**. Your user needs
+to be in the `dialout` group.
 
 ```sh
 make program
-python3 host/gemm_uart.py --port /dev/ttyUSB0 --n 16
+host/build_host.sh                       # once (needs ref/build_ref.sh)
+
+# first time, or for a new model: upload the weights (~1 min) and store
+# them on the microSD card (~7 s); this overwrites the card
+ref/build/llm_host models/stories15M_q80.bin third_party/llama2.c/tokenizer.bin \
+    "Once upon a time" 64 ref/build/run -u -s
+
+# afterwards the board loads them from the card at power-on, and llm_host
+# skips the upload; -v also checks every matmul against the CPU
+ref/build/llm_host models/stories15M_q80.bin third_party/llama2.c/tokenizer.bin \
+    "Once upon a time" 64 ref/build/run -v
+cmp ref/build/run/logits.bin ref/build/stories15M/logits.bin   # identical
+
+python3 host/sd_tool.py status           # SD / DDR status
+python3 host/ddr_test.py                 # DDR memory test + matmuls from DDR
 ```
 
-The first job uses `A` = identity, the rest are random; each is checked
-against numpy. If the UART shows up under another name, check `dmesg` after
-plugging it in. Your user needs to be in the `dialout` group.
+`top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
+`host/gemm_uart.py`.

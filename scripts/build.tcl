@@ -1,19 +1,19 @@
 # Non-project Vivado build. Runs one stage per invocation and picks up from the
-# previous stage's checkpoint. All output goes to build/.
+# previous stage's checkpoint. All output goes to build/<top>/.
 #
 # Normally run through the Makefile, which decides which stages need rerunning.
 # To run a stage by hand, from the repo root:
 #   source /tools/Xilinx/2026.1/Vivado/settings64.sh
-#   mkdir -p build
-#   vivado -mode batch -nojournal -log build/synth.log -source scripts/build.tcl -tclargs synth
+#   mkdir -p build/top_qmv
+#   vivado -mode batch -nojournal -log build/top_qmv/synth.log -source scripts/build.tcl -tclargs synth top_qmv
 
 set repo_root [file normalize [file dirname [info script]]/..]
 set srcs_dir  $repo_root/src
-set out_dir   $repo_root/build
-set top       top
 set part      xc7k325tffg900-2
 
 set stage [lindex $argv 0]
+set top   [lindex $argv 1]
+set out_dir $repo_root/build/$top
 
 # Each stage writes its checkpoint last. Make treats that file as proof the stage
 # finished, so a stage that fails partway through runs again next time.
@@ -21,7 +21,16 @@ switch $stage {
     synth {
         # Only design sources belong here
         read_verilog -sv [glob $srcs_dir/sources/*.sv]
-        read_xdc [glob $srcs_dir/constrs/*.xdc]
+        read_xdc $srcs_dir/constrs/genesys2.xdc
+        if {$top eq "top_llm"} {
+            # DDR controller, generated and synthesized on its own by
+            # scripts/gen_ip.tcl (make ip). Its checkpoint is linked in here
+            # and brings its own pin and clock constraints.
+            read_ip $repo_root/build/ip/mig_ddr3/mig_ddr3.xci
+            read_xdc $srcs_dir/constrs/top_llm.xdc
+        } else {
+            read_xdc $srcs_dir/constrs/sysclk.xdc
+        }
 
         # Synthesis: RTL to a netlist of FPGA primitives. Timing here is only an
         # estimate because nothing has been placed or routed yet.
@@ -61,8 +70,18 @@ switch $stage {
         # at power-off; this does not write the flash.
         open_hw_manager
         connect_hw_server
-        open_hw_target
-        set dev [lindex [get_hw_devices xc7k325t*] 0]
+        # The board's JTAG chip shows up as two targets, and only one has the
+        # FPGA on its chain; their order varies, so try each.
+        set dev ""
+        foreach t [get_hw_targets] {
+            catch {close_hw_target}
+            if {[catch {open_hw_target -quiet $t}]} continue
+            set dev [lindex [get_hw_devices -quiet xc7k325t*] 0]
+            if {$dev ne ""} break
+        }
+        if {$dev eq ""} {
+            error "No xc7k325t found on any JTAG target: [get_hw_targets]"
+        }
         current_hw_device $dev
         set_property PROGRAM.FILE $out_dir/$top.bit $dev
         program_hw_devices $dev
