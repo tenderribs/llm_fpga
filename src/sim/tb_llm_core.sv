@@ -10,6 +10,9 @@
 //      over the UART, every result is checked bit-exact
 //   5. SD_STORE the first matmul's weights to the card model, wipe them in
 //      DDR, SD_LOAD them back, run that matmul again
+//   6. CPU side over AXI4-Lite: ID, console output on the UART, and the
+//      first matmul again with x written through the XQ / XS windows and
+//      every result read back from the Y RAM
 // The boot-time SD_LOAD (blank card: error 8) is checked through STATUS.
 module tb_llm_core #(
     parameter string VecDir0,  // first matmul vectors
@@ -38,6 +41,10 @@ module tb_llm_core #(
   logic arvalid, arready, rvalid, rready;
   logic [255:0] wdata, rdata;
   logic sd_power_n, sd_sclk, sd_cs, sd_mosi, sd_miso;
+  logic [17:0] s_awaddr, s_araddr;
+  logic s_awvalid, s_awready, s_wvalid, s_wready, s_bvalid, s_bready;
+  logic s_arvalid, s_arready, s_rvalid, s_rready;
+  logic [31:0] s_wdata, s_rdata;
 
   llm_core #(
       .ClkHz(ClkHz),
@@ -77,8 +84,71 @@ module tb_llm_core #(
       .sd_cs_o(sd_cs),
       .sd_mosi_o(sd_mosi),
       .sd_miso_i(sd_miso),
-      .sd_cd_i(1'b0)
+      .sd_cd_i(1'b0),
+      .s_awaddr_i(s_awaddr),
+      .s_awvalid_i(s_awvalid),
+      .s_awready_o(s_awready),
+      .s_wdata_i(s_wdata),
+      .s_wvalid_i(s_wvalid),
+      .s_wready_o(s_wready),
+      .s_bvalid_o(s_bvalid),
+      .s_bready_i(s_bready),
+      .s_araddr_i(s_araddr),
+      .s_arvalid_i(s_arvalid),
+      .s_arready_o(s_arready),
+      .s_rdata_o(s_rdata),
+      .s_rvalid_o(s_rvalid),
+      .s_rready_i(s_rready)
   );
+
+  // AXI4-Lite master. Drives on the falling edge and checks the ready a moment
+  // later (#1, once the slave's combinational ready has settled); a ready
+  // seen then is taken at the next rising edge. One transaction at a time.
+  task automatic axil_write(input logic [17:0] a, input logic [31:0] d);
+    @(negedge clk);
+    s_awaddr = a;
+    s_wdata = d;
+    s_awvalid = 1;
+    s_wvalid = 1;
+    #1;
+    while (!s_awready) begin
+      @(negedge clk);
+      #1;
+    end
+    @(negedge clk);  // AW and W taken at the rising edge in between
+    s_awvalid = 0;
+    s_wvalid = 0;
+    s_bready = 1;
+    #1;
+    while (!s_bvalid) begin
+      @(negedge clk);
+      #1;
+    end
+    @(negedge clk);
+    s_bready = 0;
+  endtask
+
+  task automatic axil_read(input logic [17:0] a, output logic [31:0] d);
+    @(negedge clk);
+    s_araddr = a;
+    s_arvalid = 1;
+    #1;
+    while (!s_arready) begin
+      @(negedge clk);
+      #1;
+    end
+    @(negedge clk);
+    s_arvalid = 0;
+    s_rready = 1;
+    #1;
+    while (!s_rvalid) begin
+      @(negedge clk);
+      #1;
+    end
+    d = s_rdata;
+    @(negedge clk);
+    s_rready = 0;
+  endtask
 
   sd_card_model #(
       .Blocks(512)
@@ -263,6 +333,11 @@ module tb_llm_core #(
 
     $display("TEST llm_core");
     uart_rx = 1'b1;
+    s_awvalid = 0;
+    s_wvalid = 0;
+    s_bready = 0;
+    s_arvalid = 0;
+    s_rready = 0;
     rst_n = 0;
     calib_done = 0;
     repeat (10) @(posedge clk);
@@ -355,6 +430,44 @@ module tb_llm_core #(
       end
     end
 
+    // 6. CPU side
+    begin
+      logic [31:0] v;
+      string msg = "Hi from the CPU\n";
+      int errs = 0;
+      axil_read(18'h00000, v);
+      if (v !== 32'h314D_4C4C) begin
+        $display("MISMATCH ID register %h", v);
+        errors++;
+      end
+      foreach (msg[i]) axil_write(18'h00008, 32'(msg[i]));
+      recv(msg.len(), reply);
+      foreach (reply[i]) begin
+        if (reply[i] != msg[i]) begin
+          $display("MISMATCH console byte %0d: %h, exp %h", i, reply[i], msg[i]);
+          errors++;
+        end
+      end
+
+      // x for the first matmul, through the CPU windows
+      for (int i = 0; i < N0 / P; i++)
+        for (int w = 0; w < 8; w++) axil_write(18'h01000 + 18'((i * 8 + w) * 4), xq[i][w*32+:32]);
+      for (int g = 0; g < N0 / GS; g++) axil_write(18'h01800 + 18'(g * 4), xs[g]);
+      axil_write(18'h00010, 32'h0002_0000);
+      axil_write(18'h00014, {16'(D0), 16'(N0)});
+      axil_write(18'h00018, 32'd1);
+      do axil_read(18'h00004, v); while (v[8]);
+      for (int i = 0; i < D0; i++) begin
+        axil_read(18'h20000 + 18'(i * 4), v);
+        if (v !== y_exp[i]) begin
+          if (errs < 5) $display("MISMATCH CPU matmul y[%0d]: got %08h, exp %08h", i, v, y_exp[i]);
+          errs++;
+        end
+      end
+      $display("CPU matmul %0dx%0d through the registers: %0d mismatches", D0, N0, errs);
+      errors += errs;
+    end
+
     repeat (100) @(posedge clk);
     if (rx_bytes.size() != 0) begin
       $display("MISMATCH %0d extra reply bytes", rx_bytes.size());
@@ -368,8 +481,8 @@ module tb_llm_core #(
       $display("MISMATCH %0d SD protocol errors", u_card.errors);
       errors++;
     end
-    if (led[7:4] !== 4'd3) begin
-      $display("MISMATCH job LEDs %0d, exp 3", led[7:4]);
+    if (led[7:4] !== 4'd4) begin
+      $display("MISMATCH job LEDs %0d, exp 4", led[7:4]);
       errors++;
     end
 
