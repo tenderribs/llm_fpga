@@ -26,7 +26,8 @@ module sd_card_model #(
   // ---- byte-level SPI, mode 0
   logic [7:0] rx_sh, tx_sh;
   int bitc = 0;
-  logic [7:0] out_q[$];
+  // queued reply bytes; bit 8 marks the last byte of a data block
+  logic [8:0] out_q[$];
 
   assign miso = (cs_n || power_n) ? 1'b1 : tx_sh[7];
 
@@ -43,6 +44,8 @@ module sd_card_model #(
   // multi-block read
   logic reading;
   int raddr;
+  // clocks the card still needs after a data block before it takes a command
+  int settle = 0;
 
   task automatic reset_card();
     idle = 1'b0;
@@ -67,7 +70,7 @@ module sd_card_model #(
     out_q.push_back(8'hFE);
     for (int i = 0; i < 512; i++) out_q.push_back(mem[(byte_addr+i)%(Blocks*512)]);
     out_q.push_back(8'h12);  // CRC, not checked in SPI mode
-    out_q.push_back(8'h34);
+    out_q.push_back({1'b1, 8'h34});  // last byte of the block
   endtask
 
   function automatic int addr_of(input logic [31:0] arg);
@@ -188,13 +191,21 @@ module sd_card_model #(
   always @(posedge power_n) reset_card();
 
   always @(negedge cs_n) begin
+    if (!power_n && settle > 0) begin
+      $display("SD MODEL: selected again only %0d clocks after a data block (needs 8)",
+               settle > 8 ? 0 : 8 - settle);
+      errors++;
+    end
     if (!power_n) begin
       bitc = 0;
-      tx_sh = (out_q.size() != 0) ? out_q.pop_front() : 8'hFF;
+      tx_sh = (out_q.size() != 0) ? out_q[0][7:0] : 8'hFF;
+      if (out_q.size() != 0) void'(out_q.pop_front());
     end
   end
 
   always @(posedge cs_n) cmd_len = 0;
+
+  always @(posedge sclk) if (settle > 0) settle--;
 
   always @(posedge sclk) begin
     if (!cs_n && !power_n) begin
@@ -214,8 +225,15 @@ module sd_card_model #(
 
   always @(negedge sclk) begin
     if (!cs_n && !power_n) begin
-      if (bitc == 0) tx_sh = (out_q.size() != 0) ? out_q.pop_front() : 8'hFF;
-      else tx_sh = {tx_sh[6:0], 1'b1};
+      if (bitc == 0) begin
+        logic [8:0] item = (out_q.size() != 0) ? out_q.pop_front() : 9'h0FF;
+        tx_sh = item[7:0];
+        // after the last byte of a single-block read the card needs 8 more
+        // clocks (this byte's 8 + 8) before the next command
+        if (item[8] && !reading) settle = 16;
+      end else begin
+        tx_sh = {tx_sh[6:0], 1'b1};
+      end
     end
   end
 

@@ -51,6 +51,7 @@ module sd_ctrl #(
     output logic [3:0] err_code_o,
     output logic [31:0] img_bytes_o,
     output logic [31:0] img_addr_o,
+    output logic [7:0] last_r1_o,  // last R1 response (debug)
 
     output logic sd_power_n_o,
     output logic sd_sclk_o,
@@ -186,6 +187,7 @@ module sd_ctrl #(
     S_WSTOP,       // 0xFD stop token after the last multi-block block
     S_WSTOP_GAP,
     S_WR_FINISH,
+    S_WR_HDR_CMD,  // issue CMD24 for the header block
     S_DONE
   } state_t;
   state_t state_q, ret_q;
@@ -220,6 +222,7 @@ module sd_ctrl #(
   assign err_code_o = err_q;
   assign img_bytes_o = nbytes_q;
   assign img_addr_o = ddr_addr_q;
+  assign last_r1_o = r1_q;
 
   assign m_awaddr_o = addr_q;
   assign m_awvalid_o = (state_q == S_AXI_WR) && !aw_done_q;
@@ -299,6 +302,16 @@ module sd_ctrl #(
     tries_q <= '0;
     sd_cs_o <= 1'b0;
     state_q <= S_CMD;
+  endtask
+
+  // deselect and give the card 8 clocks to finish, then continue at `next`
+  // (the card needs them after a data transfer before the next command)
+  task automatic release_then(input state_t next);
+    keep_cs_q <= 1'b0;
+    end_started_q <= 1'b0;
+    ret_q <= next;
+    sd_cs_o <= 1'b1;
+    state_q <= S_CMD_END;
   endtask
 
   task automatic fail(input logic [3:0] code);
@@ -553,8 +566,7 @@ module sd_ctrl #(
             tries_q <= tries_q + 1;
             if (tries_q == 5'd1) begin
               if (hdr_q) begin
-                sd_cs_o <= 1'b1;
-                state_q <= S_CHECK_HDR;
+                release_then(S_CHECK_HDR);
               end else if (img_left_q == 0) begin
                 state_q <= S_RD_FINISH;
               end else begin
@@ -662,9 +674,8 @@ module sd_ctrl #(
               state_q <= S_WR_FINISH;
             end else if (!multi_q) begin
               // the stop token's busy period is over: write the header
-              sd_cs_o <= 1'b1;
               hdr_q <= 1'b1;
-              issue(frame(6'd24, 32'd0, 8'h01), 1'b0, 1'b1, S_WR_HDR);
+              release_then(S_WR_HDR_CMD);
             end else if (img_left_q == 0) begin
               state_q <= S_WSTOP;
             end else begin
@@ -688,6 +699,10 @@ module sd_ctrl #(
             timer_q <= '0;
             state_q <= S_WBUSY;
           end
+        end
+
+        S_WR_HDR_CMD: begin
+          issue(frame(6'd24, 32'd0, 8'h01), 1'b0, 1'b1, S_WR_HDR);
         end
 
         S_WR_FINISH: begin

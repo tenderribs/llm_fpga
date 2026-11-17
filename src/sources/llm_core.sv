@@ -18,7 +18,7 @@
 //   0x05 SD_STORE addr:u32 nbytes:u32    reply 0x05, then copy nbytes of DDR
 //                                        at addr to the microSD card
 // STATUS reply, 12 bytes:
-//   "LLM", flags, sd_err_code, 0, 0, 0, sd_image_bytes:u32
+//   "LLM", flags, sd_err_code, sd_last_r1, 0, 0, sd_image_bytes:u32
 //   flags: 0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error, 4 card detect pin
 // SD_LOAD also runs by itself once the DDR has calibrated. While an SD
 // operation runs only STATUS is answered; other commands are dropped.
@@ -87,6 +87,7 @@ module llm_core #(
   logic sd_busy, sd_ok, sd_err;
   logic [3:0] sd_err_code;
   logic [31:0] sd_img_bytes, sd_img_addr;
+  logic [7:0] sd_last_r1;
   logic sd_load, sd_store;
   logic [31:0] sd_store_addr_q, sd_store_bytes_q;
 
@@ -146,6 +147,7 @@ module llm_core #(
       .err_code_o(sd_err_code),
       .img_bytes_o(sd_img_bytes),
       .img_addr_o(sd_img_addr),
+      .last_r1_o(sd_last_r1),
       .sd_power_n_o(sd_power_n_o),
       .sd_sclk_o(sd_sclk_o),
       .sd_cs_o(sd_cs_o),
@@ -434,6 +436,7 @@ module llm_core #(
           4'd2: tx_data = "M";
           4'd3: tx_data = {3'b0, sd_cd_i, sd_err, sd_ok, sd_busy, calib_done_i};
           4'd4: tx_data = {4'b0, sd_err_code};
+          4'd5: tx_data = sd_last_r1;
           4'd8: tx_data = sd_img_bytes[7:0];
           4'd9: tx_data = sd_img_bytes[15:8];
           4'd10: tx_data = sd_img_bytes[23:16];
