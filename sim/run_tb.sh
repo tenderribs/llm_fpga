@@ -14,11 +14,11 @@ TAG=$2
 shift 2
 OUT="$REPO/sim/build/verilator/$TB/$TAG"
 
-# top_llm.sv is left out: it needs the DDR controller IP (simulate
+# top_llm.sv and top_soc.sv are left out: they need vendor IP (simulate
 # llm_core instead, see tb_llm_core)
 SOURCES=("$REPO/sim/IBUFDS.v" "$REPO/sim/BUFG.v")
 while IFS= read -r f; do SOURCES+=("$f"); done \
-  < <(find "$REPO/src/sources" -name '*.sv' ! -name 'top_llm.sv' | sort)
+  < <(find "$REPO/src/sources" -name '*.sv' ! -name 'top_llm.sv' ! -name 'top_soc.sv' | sort)
 # simulation models (src/sim/ files that aren't testbenches), then the TB
 while IFS= read -r f; do SOURCES+=("$f"); done \
   < <(find "$REPO/src/sim" -name '*.sv' ! -name 'tb_*' | sort)
