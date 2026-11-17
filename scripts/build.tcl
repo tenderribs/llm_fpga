@@ -70,8 +70,18 @@ switch $stage {
         # at power-off; this does not write the flash.
         open_hw_manager
         connect_hw_server
-        open_hw_target
-        set dev [lindex [get_hw_devices xc7k325t*] 0]
+        # The board's JTAG chip shows up as two targets, and only one has the
+        # FPGA on its chain; their order varies, so try each.
+        set dev ""
+        foreach t [get_hw_targets] {
+            catch {close_hw_target}
+            if {[catch {open_hw_target -quiet $t}]} continue
+            set dev [lindex [get_hw_devices -quiet xc7k325t*] 0]
+            if {$dev ne ""} break
+        }
+        if {$dev eq ""} {
+            error "No xc7k325t found on any JTAG target: [get_hw_targets]"
+        }
         current_hw_device $dev
         set_property PROGRAM.FILE $out_dir/$top.bit $dev
         program_hw_devices $dev
