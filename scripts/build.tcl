@@ -1,19 +1,19 @@
 # Non-project Vivado build. Runs one stage per invocation and picks up from the
-# previous stage's checkpoint. All output goes to build/.
+# previous stage's checkpoint. All output goes to build/<top>/.
 #
 # Normally run through the Makefile, which decides which stages need rerunning.
 # To run a stage by hand, from the repo root:
 #   source /tools/Xilinx/2026.1/Vivado/settings64.sh
-#   mkdir -p build
-#   vivado -mode batch -nojournal -log build/synth.log -source scripts/build.tcl -tclargs synth
+#   mkdir -p build/top_qmv
+#   vivado -mode batch -nojournal -log build/top_qmv/synth.log -source scripts/build.tcl -tclargs synth top_qmv
 
 set repo_root [file normalize [file dirname [info script]]/..]
 set srcs_dir  $repo_root/src
-set out_dir   $repo_root/build
-set top       top
 set part      xc7k325tffg900-2
 
 set stage [lindex $argv 0]
+set top   [lindex $argv 1]
+set out_dir $repo_root/build/$top
 
 # Each stage writes its checkpoint last. Make treats that file as proof the stage
 # finished, so a stage that fails partway through runs again next time.

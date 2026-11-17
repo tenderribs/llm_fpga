@@ -1,13 +1,13 @@
 `timescale 1ns / 1ps
 
-// End-to-end test of top: drives A, B, C into the UART RX pin, decodes Y from
+// End-to-end test of top_gemm: drives A, B, C into the UART RX pin, decodes Y from
 // the UART TX pin and compares it to the golden vectors. The baud rate is set
 // to 8 clocks per bit so the sim runs quickly.
 //
 // Sequence:
 //   1. a few stray bytes, then silence: the idle timeout must discard them
 //   2. two full jobs back to back, both checked
-module tb_top #(
+module tb_top_gemm #(
     parameter int N,
     parameter string AFile,
     parameter string BFile,
@@ -33,7 +33,7 @@ module tb_top #(
   logic signed [7:0] c[N][N];
   logic signed [31:0] y_exp[N][N];
 
-  top #(
+  top_gemm #(
       .N(N),
       .ClkHz(ClkHz),
       .Baud(ClkHz / ClksPerBit),

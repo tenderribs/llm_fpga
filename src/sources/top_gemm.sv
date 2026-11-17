@@ -12,7 +12,7 @@
 //
 // LEDs: 0 heartbeat, 1 receiving, 2 computing, 3 sending,
 //       7:4 count of completed jobs (mod 16)
-module top #(
+module top_gemm #(
     parameter int N = 16,
     parameter int ClkHz = 200_000_000,
     parameter int Baud = 115_200,
