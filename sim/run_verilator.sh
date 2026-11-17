@@ -14,9 +14,11 @@ BUILD="$REPO/sim/build/verilator/$TB"
 PYTHON=python3
 [[ -x "$REPO/.venv/bin/python" ]] && PYTHON="$REPO/.venv/bin/python"
 
+# top_llm.sv is left out: it needs the DDR controller IP (simulate
+# llm_core instead, see tb_llm_core)
 SOURCES=("$REPO/sim/IBUFDS.v" "$REPO/sim/BUFG.v")
 while IFS= read -r f; do SOURCES+=("$f"); done \
-  < <(find "$REPO/src/sources" -name '*.sv' | sort)
+  < <(find "$REPO/src/sources" -name '*.sv' ! -name 'top_llm.sv' | sort)
 SOURCES+=("$REPO/src/sim/$TB.sv")
 
 if (($#)); then SIZES=("$@"); else SIZES=(2); fi

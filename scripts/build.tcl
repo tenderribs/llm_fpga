@@ -21,7 +21,16 @@ switch $stage {
     synth {
         # Only design sources belong here
         read_verilog -sv [glob $srcs_dir/sources/*.sv]
-        read_xdc [glob $srcs_dir/constrs/*.xdc]
+        read_xdc $srcs_dir/constrs/genesys2.xdc
+        if {$top eq "top_llm"} {
+            # DDR controller, generated and synthesized on its own by
+            # scripts/gen_ip.tcl (make ip). Its checkpoint is linked in here
+            # and brings its own pin and clock constraints.
+            read_ip $repo_root/build/ip/mig_ddr3/mig_ddr3.xci
+            read_xdc $srcs_dir/constrs/top_llm.xdc
+        } else {
+            read_xdc $srcs_dir/constrs/sysclk.xdc
+        }
 
         # Synthesis: RTL to a netlist of FPGA primitives. Timing here is only an
         # estimate because nothing has been placed or routed yet.
