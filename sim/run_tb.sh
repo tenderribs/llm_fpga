@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build and run one testbench with Verilator.
 # Usage: sim/run_tb.sh <tb_name> <run_tag> [verilator -G args ...]
-#   builds src/sim/<tb_name>.sv with every file in src/sources/ into
+#   builds src/sim/<tb_name>.sv with every file in src/sources/ and the
+#   simulation models in src/sim/ (files not named tb_*) into
 #   sim/build/verilator/<tb_name>/<run_tag>/, runs it, and prints the
 #   TEST / MISMATCH / FAIL / TIMEOUT lines. Exit status 0 only on TEST PASSED.
 #   VERBOSE=1 prints the whole sim log; TRACE=1 writes a waveform (out.fst).
@@ -13,9 +14,14 @@ TAG=$2
 shift 2
 OUT="$REPO/sim/build/verilator/$TB/$TAG"
 
+# top_llm.sv is left out: it needs the DDR controller IP (simulate
+# llm_core instead, see tb_llm_core)
 SOURCES=("$REPO/sim/IBUFDS.v" "$REPO/sim/BUFG.v")
 while IFS= read -r f; do SOURCES+=("$f"); done \
-  < <(find "$REPO/src/sources" -name '*.sv' | sort)
+  < <(find "$REPO/src/sources" -name '*.sv' ! -name 'top_llm.sv' | sort)
+# simulation models (src/sim/ files that aren't testbenches), then the TB
+while IFS= read -r f; do SOURCES+=("$f"); done \
+  < <(find "$REPO/src/sim" -name '*.sv' ! -name 'tb_*' | sort)
 SOURCES+=("$REPO/src/sim/$TB.sv")
 
 TRACE_ARGS=()

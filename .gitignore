@@ -77,4 +77,5 @@ CLAUDE*.md
 
 ## Vivado writes this into the working directory on every implementation run
 clockInfo.txt
+tight_setup_hold_pins.txt
 __pycache__/
