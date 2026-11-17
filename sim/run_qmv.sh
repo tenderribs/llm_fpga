@@ -3,6 +3,8 @@
 #   1. tb_fp32: float units against numpy float32
 #   2. tb_qmv:  qmv on real runq.c matmuls, bit-exact
 #   3. tb_top_qmv: top_qmv through its UART pins, on one matmul
+#   4. tb_llm_core: llm_core's commands, matmuls with weights read from an
+#      AXI memory model (needs dumps 000 and 006)
 # Needs the golden dumps from ref/build_ref.sh.
 # Usage: sim/run_qmv.sh [dump index ...]   (default: 000 004 006 042)
 #   plus a random 256x512 matmul with group size 64, always
@@ -44,5 +46,11 @@ out="$VEC/mm_000"
 echo "=== top_qmv over UART: mm_000 ==="
 "$REPO/sim/run_tb.sh" tb_top_qmv mm_000 -GVecDir="\"$out\"" -GN=288 -GD=288 -GGS=32 \
   || status=1
+
+# llm_core (UART commands, DDR weight reader, qmv) with an AXI memory model
+echo "=== llm_core: STATUS, WRITE/READ, matmuls from DDR ==="
+"$REPO/sim/run_tb.sh" tb_llm_core default \
+  -GVecDir0="\"$VEC/mm_000\"" -GN0=288 -GD0=288 \
+  -GVecDir1="\"$VEC/mm_006\"" -GN1=768 -GD1=288 || status=1
 
 exit $status
