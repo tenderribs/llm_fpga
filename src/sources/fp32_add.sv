@@ -22,7 +22,7 @@ module fp32_add #(
     output logic [TagW-1:0] tag_o,
     output logic [31:0] y_o
 );
-  localparam int Latency = 6;
+  localparam int Latency = 7;
 
   logic [Latency-1:0] valid_q;
   logic [Latency-1:0][TagW-1:0] tag_q;
@@ -37,20 +37,32 @@ module fp32_add #(
   assign valid_o = valid_q[Latency-1];
   assign tag_o   = tag_q[Latency-1];
 
-  // S1: unpack, order by magnitude so |hi| >= |lo|. With subnormals read
-  // as zero, comparing bits 30:0 as an integer compares magnitudes.
-  logic [31:0] a_ftz, b_ftz, hi, lo;
-  always_comb begin
-    a_ftz = (a_i[30:23] == '0) ? {a_i[31], 31'd0} : a_i;
-    b_ftz = (b_i[30:23] == '0) ? {b_i[31], 31'd0} : b_i;
-    if (a_ftz[30:0] >= b_ftz[30:0]) begin
-      hi   = a_ftz;
-      lo = b_ftz;
-    end else begin
-      hi   = b_ftz;
-      lo = a_ftz;
-    end
+  // S0: register the inputs (subnormals read as zero) together with the
+  // magnitude comparison and both exponent differences, so S1 only selects.
+  // With subnormals read as zero, comparing bits 30:0 as an integer compares
+  // magnitudes.
+  logic [31:0] a_ftz, b_ftz;
+  assign a_ftz = (a_i[30:23] == '0) ? {a_i[31], 31'd0} : a_i;
+  assign b_ftz = (b_i[30:23] == '0) ? {b_i[31], 31'd0} : b_i;
+
+  logic [31:0] s0_a, s0_b;
+  logic s0_a_ge_b;
+  logic [7:0] s0_d_ab, s0_d_ba;  // ea - eb, eb - ea (one is used, and >= 0)
+
+  always_ff @(posedge clk_i) begin
+    s0_a      <= a_ftz;
+    s0_b      <= b_ftz;
+    s0_a_ge_b <= a_ftz[30:0] >= b_ftz[30:0];
+    s0_d_ab   <= a_ftz[30:23] - b_ftz[30:23];
+    s0_d_ba   <= b_ftz[30:23] - a_ftz[30:23];
   end
+
+  // S1: order by magnitude so |hi| >= |lo|
+  logic [31:0] hi, lo;
+  logic [7:0] exp_diff;
+  assign hi = s0_a_ge_b ? s0_a : s0_b;
+  assign lo = s0_a_ge_b ? s0_b : s0_a;
+  assign exp_diff = s0_a_ge_b ? s0_d_ab : s0_d_ba;
 
   logic s1_sign, s1_sub, s1_both_neg;
   logic [7:0] s1_exp;
@@ -60,9 +72,9 @@ module fp32_add #(
   always_ff @(posedge clk_i) begin
     s1_sign     <= hi[31];
     s1_sub      <= hi[31] ^ lo[31];
-    s1_both_neg <= a_i[31] & b_i[31];
+    s1_both_neg <= s0_a[31] & s0_b[31];
     s1_exp      <= hi[30:23];
-    s1_shift    <= (hi[30:23] - lo[30:23] > 8'd31) ? 5'd31 : 5'(hi[30:23] - lo[30:23]);
+    s1_shift    <= (exp_diff > 8'd31) ? 5'd31 : exp_diff[4:0];
     s1_mbig     <= (hi[30:23] == '0) ? 24'd0 : {1'b1, hi[22:0]};
     s1_msmall   <= (lo[30:23] == '0) ? 24'd0 : {1'b1, lo[22:0]};
   end

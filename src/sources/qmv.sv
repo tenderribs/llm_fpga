@@ -61,7 +61,7 @@ module qmv #(
   localparam int BeatsPerGroup = GS / P;
   localparam int XqDepth = MaxN / P;
   localparam int XsDepth = MaxN / GS;
-  localparam int AddLatency = 6;  // fp32_add Latency
+  localparam int AddLatency = 7;  // fp32_add Latency
 
   // The row's previous sum is read when a new term enters the adder and
   // written AddLatency cycles later. The same row comes back R*BeatsPerGroup
