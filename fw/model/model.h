@@ -44,6 +44,7 @@ typedef struct {
     float *x, *xb, *xb2, *hb, *hb2, *q, *k, *v, *att, *logits;
     float *key_cache, *value_cache;
     QTensor xq, hq;
+    float *rope_freq, *rope_cos, *rope_sin;  // RoPE per pair in a head
 } RunState;
 
 // 0 on success, else a message
@@ -99,5 +100,6 @@ const char *printable(const char *piece);
 
 // ---- float math (fw/model/mathf.c)
 float m_expf(float x);
+void m_expf4(const float *x, float *y);
 void m_sincosf(float x, float *s, float *c);
 float m_roundf(float x);

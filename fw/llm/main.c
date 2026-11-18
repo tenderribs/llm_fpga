@@ -111,10 +111,14 @@ static void generate(const Model *m, Tokenizer *tok, RunState *s, const char *pr
         t0 = LLM_CYCLES;
     }
     double secs = (double)total / CLK_HZ;
+    double per = 1e3 / CLK_HZ / pos;
+    uint64_t parts = g_mm_cycles + prof_cycles[PROF_ATT] + prof_cycles[PROF_NORM] +
+                     prof_cycles[PROF_QUANT] + prof_cycles[PROF_ROPE] + prof_cycles[PROF_FFN];
     printf("\n\n[%d tokens in %.2f s: %.1f tok/s; ms per token: matmul %.1f, attention %.1f, "
-           "other %.1f]\n", pos, secs, pos / secs, g_mm_cycles * 1e3 / CLK_HZ / pos,
-           prof_cycles[PROF_ATT] * 1e3 / CLK_HZ / pos,
-           (total - g_mm_cycles - prof_cycles[PROF_ATT]) * 1e3 / CLK_HZ / pos);
+           "quantize %.1f, swiglu %.1f, rmsnorm %.1f, rope %.1f, other %.1f]\n", pos, secs,
+           pos / secs, g_mm_cycles * per, prof_cycles[PROF_ATT] * per,
+           prof_cycles[PROF_QUANT] * per, prof_cycles[PROF_FFN] * per,
+           prof_cycles[PROF_NORM] * per, prof_cycles[PROF_ROPE] * per, (total - parts) * per);
     if (trace) {
         if (argmax_mismatch) printf("LLM FAIL: hardware argmax differs %d times\n", argmax_mismatch);
         for (int p = 0; p < pos; p++)

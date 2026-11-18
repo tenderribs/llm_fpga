@@ -39,6 +39,35 @@ float m_expf(float x) {
     return p * from_bits((uint32_t)(n + 127) << 23);
 }
 
+// m_expf on four values at once, the same operations on each: four
+// independent chains the FPU overlaps (one chain waits on every operation's
+// latency). Outside the range where 2^n is a normal number, lane by lane.
+void m_expf4(const float *x, float *y) {
+    const float LOG2E = 1.44269502163f, LN2_HI = 0.693145751953125f, LN2_LO = 1.42860676533e-6f;
+    for (int k = 0; k < 4; k++) {
+        if (!(x[k] > -87.0f && x[k] < 88.0f)) {
+            for (int j = 0; j < 4; j++) y[j] = m_expf(x[j]);
+            return;
+        }
+    }
+#define LANE(k)                                                                        \
+    float t##k = x[k] * LOG2E;                                                        \
+    int32_t n##k = (int32_t)(t##k < 0.0f ? t##k - 0.5f : t##k + 0.5f);               \
+    float r##k = (x[k] - (float)n##k * LN2_HI) - (float)n##k * LN2_LO;               \
+    float p##k = 1.0f / 5040;
+    LANE(0) LANE(1) LANE(2) LANE(3)
+#undef LANE
+#define STEP(c) p0 = (c) + r0 * p0; p1 = (c) + r1 * p1; p2 = (c) + r2 * p2; p3 = (c) + r3 * p3;
+    // the same Horner steps as m_expf: 1 + r (1 + r (1/2 + r (1/6 + ...)))
+    STEP(1.0f / 720) STEP(1.0f / 120) STEP(1.0f / 24) STEP(1.0f / 6) STEP(0.5f) STEP(1.0f)
+    STEP(1.0f)
+#undef STEP
+    y[0] = p0 * from_bits((uint32_t)(n0 + 127) << 23);
+    y[1] = p1 * from_bits((uint32_t)(n1 + 127) << 23);
+    y[2] = p2 * from_bits((uint32_t)(n2 + 127) << 23);
+    y[3] = p3 * from_bits((uint32_t)(n3 + 127) << 23);
+}
+
 // x = k pi/2 + r, |r| <= pi/4; pi/2 in three parts, the first two with 12
 // significant bits so k * part is exact for |k| < 2^12 (|x| < ~6400)
 void m_sincosf(float x, float *s, float *c) {

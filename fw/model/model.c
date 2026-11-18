@@ -8,16 +8,34 @@
 
 #ifdef MODEL_LIBM
 #define EXPF(x) expf(x)
-#define ROUNDF(x) round(x)
+static void EXPF4(const float *x, float *y) {
+    for (int k = 0; k < 4; k++) y[k] = expf(x[k]);
+}
+#define ROUNDI(x) ((int32_t)round(x))
 static void SINCOSF(float x, float *s, float *c) { *c = cosf(x); *s = sinf(x); }
 #define ROPE_FREQ(e) (1.0f / powf(10000.0f, (e)))
 #else
 #define EXPF(x) m_expf(x)
-#define ROUNDF(x) m_roundf(x)
+#define EXPF4(x, y) m_expf4(x, y)
+#if defined(__riscv)
+// round half away from zero to an integer in one instruction (exact, so the
+// same as m_roundf)
+static inline int32_t ROUNDI(float x) {
+    int32_t r;
+    __asm__("fcvt.w.s %0, %1, rmm" : "=r"(r) : "f"(x));
+    return r;
+}
+#else
+#define ROUNDI(x) ((int32_t)m_roundf(x))
+#endif
 #define SINCOSF(x, s, c) m_sincosf(x, s, c)
 // 10000^-e = e^(-e ln 10000)
 #define ROPE_FREQ(e) (1.0f / m_expf((e) * 9.21034049987793f))
 #endif
+
+// The loops below work on four independent elements at a time where they
+// can, so the CPU's pipelined FPU overlaps them; each element still gets
+// runq.c's operations, and every sum still adds in runq.c's order.
 
 #ifdef MODEL_PROFILE
 uint64_t prof_cycles[PROF_N];
@@ -72,6 +90,18 @@ int run_state_alloc(RunState *s, const Config *p) {
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    // RoPE's frequency depends only on the pair's place in the head, and its
+    // sin / cos only on that and the position: computed once, and once per
+    // token, instead of in every layer
+    int head_size = p->dim / p->n_heads;
+    s->rope_freq = fast_calloc(head_size / 2, sizeof(float));
+    s->rope_cos = fast_calloc(head_size / 2, sizeof(float));
+    s->rope_sin = fast_calloc(head_size / 2, sizeof(float));
+    if (!s->rope_freq || !s->rope_cos || !s->rope_sin) return 0;
+    for (int k = 0; k < head_size / 2; k++) {
+        int head_dim = 2 * k;
+        s->rope_freq[k] = ROPE_FREQ(head_dim / (float)head_size);
+    }
     return s->x && s->xb && s->xb2 && s->hb && s->hb2 && s->xq.q && s->xq.s && s->hq.q &&
            s->hq.s && s->q && s->k && s->v && s->att && s->logits && s->key_cache &&
            s->value_cache;
@@ -83,7 +113,28 @@ static void rmsnorm(float *o, const float *x, const float *weight, int size) {
     ss /= size;
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
-    for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
+    int j = 0;
+    for (; j + 4 <= size; j += 4) {  // o may be x: read all four first
+        float a0 = weight[j] * (ss * x[j]), a1 = weight[j + 1] * (ss * x[j + 1]);
+        float a2 = weight[j + 2] * (ss * x[j + 2]), a3 = weight[j + 3] * (ss * x[j + 3]);
+        o[j] = a0;
+        o[j + 1] = a1;
+        o[j + 2] = a2;
+        o[j + 3] = a3;
+    }
+    for (; j < size; j++) o[j] = weight[j] * (ss * x[j]);
+}
+
+static void div4(float *x, int size, float d) {  // x[i] /= d
+    int i = 0;
+    for (; i + 4 <= size; i += 4) {
+        float a0 = x[i] / d, a1 = x[i + 1] / d, a2 = x[i + 2] / d, a3 = x[i + 3] / d;
+        x[i] = a0;
+        x[i + 1] = a1;
+        x[i + 2] = a2;
+        x[i + 3] = a3;
+    }
+    for (; i < size; i++) x[i] /= d;
 }
 
 static void softmax(float *x, int size) {
@@ -91,25 +142,45 @@ static void softmax(float *x, int size) {
     for (int i = 1; i < size; i++)
         if (x[i] > max_val) max_val = x[i];
     float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
+    int i = 0;
+    for (; i + 4 <= size; i += 4) {
+        float d[4] = {x[i] - max_val, x[i + 1] - max_val, x[i + 2] - max_val, x[i + 3] - max_val};
+        EXPF4(d, x + i);
+        sum += x[i];
+        sum += x[i + 1];
+        sum += x[i + 2];
+        sum += x[i + 3];
+    }
+    for (; i < size; i++) {
         x[i] = EXPF(x[i] - max_val);
         sum += x[i];
     }
-    for (int i = 0; i < size; i++) x[i] /= sum;
+    div4(x, size, sum);
 }
 
 static void quantize(QTensor *qx, const float *x, int n, int gs) {
     for (int group = 0; group < n / gs; group++) {
-        float wmax = 0.0f;
-        for (int i = 0; i < gs; i++) {
-            float val = fabsf(x[group * gs + i]);
-            if (val > wmax) wmax = val;
+        // the largest |x| (exact, so any order gives the same; fabsf is
+        // never -0 or NaN here, where fmaxf equals runq.c's compare)
+        float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+        for (int i = 0; i < gs; i += 4) {
+            m0 = fmaxf(m0, fabsf(x[group * gs + i]));
+            m1 = fmaxf(m1, fabsf(x[group * gs + i + 1]));
+            m2 = fmaxf(m2, fabsf(x[group * gs + i + 2]));
+            m3 = fmaxf(m3, fabsf(x[group * gs + i + 3]));
         }
+        float wmax = fmaxf(fmaxf(m0, m1), fmaxf(m2, m3));
         float scale = wmax / 127.0f;
         qx->s[group] = scale;
-        for (int i = 0; i < gs; i++) {
-            float quant_value = x[group * gs + i] / scale;
-            qx->q[group * gs + i] = (int8_t)ROUNDF(quant_value);
+        const float *xg = x + group * gs;
+        int8_t *qg = qx->q + group * gs;
+        for (int i = 0; i < gs; i += 4) {  // gs is a multiple of 4 (32)
+            float a0 = xg[i] / scale, a1 = xg[i + 1] / scale;
+            float a2 = xg[i + 2] / scale, a3 = xg[i + 3] / scale;
+            qg[i] = (int8_t)ROUNDI(a0);
+            qg[i + 1] = (int8_t)ROUNDI(a1);
+            qg[i + 2] = (int8_t)ROUNDI(a2);
+            qg[i + 3] = (int8_t)ROUNDI(a3);
         }
     }
 }
@@ -191,6 +262,12 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
     const float *es = m->emb_s + (size_t)token * dim / gs;
     for (int i = 0; i < dim; i++) x[i] = eq[i] * es[i / gs];
 
+    // RoPE's sin / cos for this position (the same in every layer)
+    PROF(PROF_ROPE, for (int k = 0; k < head_size / 2; k++) {
+        float val = pos * s->rope_freq[k];
+        SINCOSF(val, &s->rope_sin[k], &s->rope_cos[k]);
+    });
+
     for (int l = 0; l < p->n_layers; l++) {
         PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_att + l * dim, dim));
 
@@ -203,11 +280,8 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         {
         PROF_BEGIN();
         for (int i = 0; i < dim; i += 2) {
-            int head_dim = i % head_size;
-            float freq = ROPE_FREQ(head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr, fci;
-            SINCOSF(val, &fci, &fcr);
+            int k = (i % head_size) / 2;
+            float fcr = s->rope_cos[k], fci = s->rope_sin[k];
             int rotn = i < kv_dim ? 2 : 1;
             for (int v = 0; v < rotn; v++) {
                 float *vec = v == 0 ? s->q : s->k;
@@ -227,7 +301,7 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         for (int h = 0; h < p->n_heads; h++) {
             float *att = s->att + h * p->seq_len;
             att_scores(s, p, l, h / kv_mul, s->q + h * head_size, att, pos + 1);
-            for (int t = 0; t <= pos; t++) att[t] = att[t] / sqrt_hs;
+            div4(att, pos + 1, sqrt_hs);
             softmax(att, pos + 1);
             att_wsum(s, p, l, h / kv_mul, att, s->xb + h * head_size, pos + 1);
         }
@@ -247,7 +321,20 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         // SwiGLU
         {
         PROF_BEGIN();
-        for (int i = 0; i < hidden_dim; i++) {
+        int i = 0;
+        for (; i + 4 <= hidden_dim; i += 4) {
+            float nv[4] = {-s->hb[i], -s->hb[i + 1], -s->hb[i + 2], -s->hb[i + 3]}, e[4];
+            EXPF4(nv, e);
+            float d0 = 1.0f / (1.0f + e[0]), d1 = 1.0f / (1.0f + e[1]);
+            float d2 = 1.0f / (1.0f + e[2]), d3 = 1.0f / (1.0f + e[3]);
+            float v0 = s->hb[i] * d0, v1 = s->hb[i + 1] * d1;
+            float v2 = s->hb[i + 2] * d2, v3 = s->hb[i + 3] * d3;
+            s->hb[i] = v0 * s->hb2[i];
+            s->hb[i + 1] = v1 * s->hb2[i + 1];
+            s->hb[i + 2] = v2 * s->hb2[i + 2];
+            s->hb[i + 3] = v3 * s->hb2[i + 3];
+        }
+        for (; i < hidden_dim; i++) {
             float val = s->hb[i];
             val *= (1.0f / (1.0f + EXPF(-val)));
             val *= s->hb2[i];
