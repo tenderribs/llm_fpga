@@ -4,15 +4,19 @@ Goal: run a Llama 2-architecture model (Karpathy's llama2.c TinyStories
 models, starting with stories15M) on a Digilent Genesys 2 board (Kintex-7
 `xc7k325tffg900-2`), using llama2.c's int8 "Q8_0" format.
 
-Current state: stories15M runs on the board with every matmul on the FPGA,
-and its output is bit-identical to llama2.c's `runq.c` on a CPU. The rest of
-the model still runs on the host PC (`host/llm_host.c`), which sends one
-matmul at a time over the USB-UART, so it is slow (0.7 tokens/s, set by USB
-round trips). Next: a MicroBlaze V soft CPU on the FPGA for the rest.
+Current state: stories15M runs entirely on the board. A MicroBlaze V soft
+CPU on the FPGA runs `runq.c`'s forward pass (`fw/`), and an int8
+matrix-vector engine in the fabric does every matmul, streaming the weights
+from DDR3. The model is stored on a microSD card in the board's slot and
+loaded at power-on. Greedy generation runs at about 7 tokens/s, and every
+step's logits are bit-identical to an x86 build of the same firmware code.
+That x86 build, with the C library's math functions instead of the
+firmware's, is bit-identical to llama2.c's `runq.c`.
 
-- `top_llm` (default): 1 GB DDR3 holds the weights; the int8 matrix-vector
-  engine streams them from DDR. The weights are stored on a microSD card in
-  the board's slot and loaded into DDR at power-on (~7 s).
+- `top_soc`: MicroBlaze V + engine + DDR3 + microSD (the full system).
+- `top_llm` (default): the same without the CPU. The host PC runs the
+  model (`host/llm_host.c`) and sends one matmul at a time over the
+  USB-UART (0.7 tokens/s, set by USB round trips).
 - `top_qmv`: the same engine with the weights sent over the UART (no DDR).
 - `top_gemm`: `Y = A @ B + C` on an N×N int8 systolic array, kept for
   prompt processing later.
@@ -53,6 +57,31 @@ then the weight beats (32 int8 + float32 scale each); the FPGA streams back
 Weights sit in DDR in "qmv DDR format": the engine's beat order in chunks of
 8 beats, each one beat of 8 float32 group scales and then the 8 weight
 beats.
+
+### `top_soc`: MicroBlaze V
+
+- CPU block design (`scripts/gen_cpu.tcl`): MicroBlaze V, RV32IMF with a
+  single-precision FPU, at 150 MHz from its own clocking wizard (its
+  pipeline doesn't close at 225 MHz). 256 KB of local block RAM holds the
+  firmware, stack and hot buffers. A data cache covers DDR3. The
+  SmartConnect crosses to the 225 MHz side.
+- `llm_core` is shared: the UART command set still works, and the CPU drives
+  the engine through registers (x in, y out, see `llm_core.sv`), with its
+  console output on the same UART.
+- Address map (CPU): local memory at 0, `llm_core` at `0x4000_0000`, DDR3 at
+  `0x8000_0000` (cached up to `0x9FFF_FFFF`, uncached above).
+
+The **model image** (`host/build_image.py`) is what the firmware reads, laid
+out as it sits in DDR3:
+- a header with the config and section offsets
+- the RMSNorm weights, the Q8_0 token embedding and `tokenizer.bin`
+- every matrix in qmv DDR format
+
+`fw/model/` is `runq.c`'s forward pass, tokenizer and greedy sampler over
+that image, in `runq.c`'s float operation order (no FMA). `fw/model/mathf.c`
+has float-only `expf` / `sincosf` that give the same bits on the board's FPU
+as on x86, so `fw/build/golden` (the x86 build) is an exact golden for the
+board.
 
 ### Systolic array (`systolic_array.sv`)
 
@@ -162,7 +191,9 @@ make program         # load the bitstream over the JTAG USB port (not to flash)
 
 Each stage reruns only when its inputs have changed. Output goes to
 `build/<TOP>/`: checkpoints, logs, and the utilization and timing reports.
-`top_llm` meets timing at 225 MHz, the others at 200 MHz.
+`top_llm` meets timing at 225 MHz, `top_soc` at 225 MHz plus 150 MHz for the
+CPU, the others at 200 MHz. `make TOP=top_soc` also generates the CPU block
+design.
 
 ## Running on the board
 
@@ -187,6 +218,28 @@ cmp ref/build/run/logits.bin ref/build/stories15M/logits.bin   # identical
 python3 host/sd_tool.py status           # SD / DDR status
 python3 host/ddr_test.py                 # DDR memory test + matmuls from DDR
 ```
+
+### `top_soc`: the model on the board's CPU
+
+```sh
+make TOP=top_soc program
+python3 host/build_image.py models/stories15M_q80.bin \
+    third_party/llama2.c/tokenizer.bin models/stories15M.img
+# once per model (~2 min): DDR over the UART, then the microSD card
+python3 host/image_tool.py upload models/stories15M.img --store
+
+make -C fw                               # firmware (RISC-V gcc from Vivado)
+python3 host/console.py --until 'LLM (DONE|FAIL)' > run.txt &
+xsdb scripts/run_fw.tcl fw/build/llm.elf # load over JTAG and start
+
+make -C fw golden                        # check against the x86 golden
+fw/build/golden models/stories15M.img "Once upon a time" 256 /tmp > golden.txt
+grep '^T ' run.txt | diff - golden.txt   # identical
+```
+
+`fw/build/bringup.elf` tests the CPU, FPU, DDR3 and the engine, and
+`fw/build/membench.elf` measures memory latency. The firmware isn't in flash
+yet: it is loaded over JTAG after each programming.
 
 `top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
 `host/gemm_uart.py`.
