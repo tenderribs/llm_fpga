@@ -108,7 +108,9 @@ module tb_llm_core #(
       .s_rready_i(s_rready),
       .yb_clk_i(clk),
       .yb_en_i(yb_en),
+      .yb_we_i(yb_we),
       .yb_addr_i(yb_addr),
+      .yb_din_i(yb_din),
       .yb_dout_o(yb_dout)
   );
 
@@ -125,7 +127,8 @@ module tb_llm_core #(
 
   // the Y RAM's second port: read one word (data one cycle after en)
   logic yb_en = 0;
-  logic [31:0] yb_addr = '0, yb_dout;
+  logic [3:0] yb_we = '0;
+  logic [31:0] yb_addr = '0, yb_din = '0, yb_dout;
   task automatic yb_read(input int i, output logic [31:0] d);
     @(negedge clk);
     yb_addr = 32'h0010_0000 + 32'(i * 4);
@@ -589,6 +592,88 @@ module tb_llm_core #(
       errors += errs;
     end
 
+    // 8. vector unit: x floats into V over the local bus, QUANT into the
+    //    matmul's x, the first matmul again with results at MM_YOFF; then
+    //    scores (K as in 7), SOFTMAX into the A RAM, weighted sum (V as in 7)
+    begin
+      logic [31:0] v;
+      logic [31:0] xfw[2048];
+      logic [31:0] y_att[48];
+      int errs = 0;
+      // wipe x in the engine
+      begin
+        logic [7:0] zr[$];
+        send_byte(8'h03);
+        send_u32(32'h0002_0000);
+        send_u32({16'(D0), 16'(N0)});
+        for (int i = 0; i < N0; i++) send_byte(8'h00);
+        for (int i = 0; i < N0 / GS; i++) send_u32(32'h0);
+        recv(4 * D0, zr);
+      end
+      $readmemh({VecDir0, "/y.hex"}, y_exp);
+      // x as floats that quantize back to this q and scale (sim/gen_vpu.py xf)
+      $readmemh({VecDir0, "/xf.hex"}, xfw);
+      for (int i = 0; i < N0; i++) begin
+        @(negedge clk);
+        yb_addr = 32'h0012_0000 + 32'(4 * i);
+        yb_din = xfw[i];
+        yb_we = 4'hF;
+        yb_en = 1;
+        @(negedge clk);
+        yb_en = 0;
+        yb_we = 0;
+      end
+      axil_write(18'h00054, 32'(N0));
+      axil_write(18'h00058, 32'd0);
+      axil_write(18'h00050, 32'h101);  // QUANT from V
+      do axil_read(18'h00004, v); while (v[8]);
+      axil_write(18'h00044, 32'd1000);  // MM_YOFF
+      axil_write(18'h00010, 32'h0002_0000);
+      axil_write(18'h00014, {16'(D0), 16'(N0)});
+      axil_write(18'h00018, 32'd1);
+      do axil_read(18'h00004, v); while (v[8]);
+      axil_write(18'h00044, 32'd0);
+      for (int i = 0; i < D0; i++) begin
+        yb_read(1000 + i, v);
+        if (v !== y_exp[i]) begin
+          if (errs < 5) $display("MISMATCH QUANT + matmul y[%0d]: got %08h, exp %08h", i, v, y_exp[i]);
+          errs++;
+        end
+      end
+      $display("vector unit QUANT, then the matmul at MM_YOFF: %0d mismatches", errs);
+      errors += errs;
+
+      errs = 0;
+      $readmemh({VecDirAttS, "/../chain48_37/y.hex"}, y_att);
+      begin
+        logic [31:0] q_vals[48];
+        $readmemh({VecDirAttS, "/a.hex"}, q_vals);
+        for (int i = 0; i < 48; i++) axil_write(18'h04000 + 18'(i * 4), q_vals[i]);
+      end
+      axil_write(18'h00030, 32'h0018_0000);
+      axil_write(18'h00034, {16'd37, 16'd48});
+      axil_write(18'h00038, 32'd0);  // scores into Y[0..47]
+      do axil_read(18'h00004, v); while (v[8]);
+      axil_write(18'h00054, 32'd37);
+      axil_write(18'h00058, 32'd0);
+      axil_write(18'h00060, 32'd2000);
+      axil_write(18'h00064, 32'h40DDB3D7);  // sqrtf(48)
+      axil_write(18'h00050, 32'h3);  // SOFTMAX into the A RAM
+      do axil_read(18'h00004, v); while (v[8]);
+      axil_write(18'h00030, 32'h001A_0000);
+      axil_write(18'h00038, 32'd1);  // weighted sum into Y[0..47]
+      do axil_read(18'h00004, v); while (v[8]);
+      for (int i = 0; i < 48; i++) begin
+        yb_read(i, v);
+        if (v !== y_att[i]) begin
+          if (errs < 5) $display("MISMATCH scores -> SOFTMAX -> sum y[%0d]: got %08h, exp %08h", i, v, y_att[i]);
+          errs++;
+        end
+      end
+      $display("attention with the vector unit's softmax: %0d mismatches", errs);
+      errors += errs;
+    end
+
     repeat (100) @(posedge clk);
     if (rx_bytes.size() != 0) begin
       $display("MISMATCH %0d extra reply bytes", rx_bytes.size());
@@ -602,8 +687,8 @@ module tb_llm_core #(
       $display("MISMATCH %0d SD protocol errors", u_card.errors);
       errors++;
     end
-    if (led[7:4] !== 4'd7) begin
-      $display("MISMATCH job LEDs %0d, exp 7", led[7:4]);
+    if (led[7:4] !== 4'd11) begin
+      $display("MISMATCH job LEDs %0d, exp 11", led[7:4]);
       errors++;
     end
 

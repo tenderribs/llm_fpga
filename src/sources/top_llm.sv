@@ -183,7 +183,9 @@ module top_llm #(
       .s_rready_i(1'b1),
       .yb_clk_i(ui_clk),
       .yb_en_i(1'b0),
+      .yb_we_i('0),
       .yb_addr_i('0),
+      .yb_din_i('0),
       .yb_dout_o()
   );
 

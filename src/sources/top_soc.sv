@@ -64,9 +64,10 @@ module top_soc #(
   logic c_arvalid, c_arready, c_rvalid, c_rready;
   logic [255:0] c_wdata, c_rdata;
 
-  // CPU local memory bus -> llm_core's Y RAM
+  // CPU local memory bus -> llm_core's Y RAM (read) and V RAM (read / write)
   logic yb_clk, yb_en;
-  logic [31:0] yb_addr, yb_dout;
+  logic [3:0] yb_we;
+  logic [31:0] yb_addr, yb_din, yb_dout;
 
   // CPU -> llm_core registers
   logic [31:0] p_awaddr, p_araddr, p_wdata, p_rdata;
@@ -144,14 +145,14 @@ module top_soc #(
       .M_AXI_PERIPH_rvalid(p_rvalid),
       .M_AXI_PERIPH_rready(p_rready),
 
-      // llm_core's Y RAM on the CPU's local memory bus (read only)
+      // llm_core's Y RAM (read) and V RAM (read / write) on the CPU's local memory bus
       .Y_BRAM_addr(yb_addr),
       .Y_BRAM_clk(yb_clk),
-      .Y_BRAM_din(),
+      .Y_BRAM_din(yb_din),
       .Y_BRAM_dout(yb_dout),
       .Y_BRAM_en(yb_en),
       .Y_BRAM_rst(),
-      .Y_BRAM_we(),
+      .Y_BRAM_we(yb_we),
 
       .M_AXI_DDR_awaddr(d_awaddr),
       .M_AXI_DDR_awlen(d_awlen),
@@ -238,7 +239,9 @@ module top_soc #(
       .s_rready_i(p_rready),
       .yb_clk_i(yb_clk),
       .yb_en_i(yb_en),
+      .yb_we_i(yb_we),
       .yb_addr_i(yb_addr),
+      .yb_din_i(yb_din),
       .yb_dout_o(yb_dout)
   );
 

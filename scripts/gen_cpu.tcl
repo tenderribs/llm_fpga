@@ -14,7 +14,7 @@
 #
 # Address map (CPU and S_AXI_EXT view):
 #   0x0000_0000  256 KB  local memory (CPU only)
-#   0x0010_0000  128 KB  Y_BRAM: llm_core's result RAM on the data-side LMB
+#   0x0010_0000  256 KB  Y_BRAM: llm_core's result RAM (+128 KB: its V RAM) on the data-side LMB
 #                        (CPU only, read at local-memory speed)
 #   0x4000_0000  256 KB  M_AXI_PERIPH: llm_core registers (CPU only)
 #   0x8000_0000    1 GB  M_AXI_DDR: DDR3. The caches cover the lower 512 MB
@@ -175,7 +175,7 @@ connect_bd_intf_net [get_bd_intf_pins mdm/MBDEBUG_0] [get_bd_intf_pins mbv/DEBUG
 # ---------------------------------------------------------------------------
 assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs ilmb_ctrl/SLMB/Mem]
 assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs dlmb_ctrl/SLMB/Mem]
-assign_bd_address -offset 0x00100000 -range 128K [get_bd_addr_segs ylmb_ctrl/SLMB/Mem]
+assign_bd_address -offset 0x00100000 -range 256K [get_bd_addr_segs ylmb_ctrl/SLMB/Mem]
 foreach space {mbv/Instruction mbv/Data} {
     assign_bd_address -target_address_space [get_bd_addr_spaces $space] \
         -offset 0x80000000 -range 1G [get_bd_addr_segs M_AXI_DDR/Reg]

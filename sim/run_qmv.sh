@@ -50,6 +50,7 @@ echo "=== top_qmv over UART: mm_000 ==="
 
 # llm_core (UART commands, DDR weight reader, qmv) with an AXI memory model
 "$PYTHON" "$REPO/sim/gen_attn.py" "$VEC/attn" > /dev/null
+"$PYTHON" "$REPO/sim/gen_vpu.py" xf "$VEC/mm_000"
 echo "=== llm_core: STATUS, WRITE/READ, matmuls from DDR ==="
 "$REPO/sim/run_tb.sh" tb_llm_core default \
   -GVecDir0="\"$VEC/mm_000\"" -GN0=288 -GD0=288 \

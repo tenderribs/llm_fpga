@@ -8,6 +8,7 @@ same order (sim/fp_ref.py for m_expf).
                           SILU: results; SOFTMAX: attention weights
 
 usage: python3 sim/gen_vpu.py OUTDIR   (prints the tb parameters per case)
+       python3 sim/gen_vpu.py xf DIR  (float x for a matmul vector set)
 """
 
 from pathlib import Path
@@ -60,7 +61,22 @@ def words(a) -> list:
     return [f"{int(u):08x}" for u in np.asarray(a).view(np.uint32)]
 
 
+def xf(d: Path):
+    """d/xf.hex: float x = q * scale from a matmul vector set's xq / xs (it
+    quantizes back to the same q and scales), for tb_llm_core"""
+    lines = [int(l, 16) for l in open(d / "xq.hex") if l.strip()]
+    q = np.concatenate([np.frombuffer(v.to_bytes(32, "little"), np.int8) for v in lines])
+    xs = np.array([int(l, 16) for l in open(d / "xs.hex") if l.strip()], np.uint32).view(f32)
+    x = (q.astype(f32) * np.repeat(xs, 32)).astype(f32)
+    q2, s2 = quantize(x)
+    assert np.array_equal(q, q2) and np.array_equal(bits(xs), bits(s2))
+    (d / "xf.hex").write_text("\n".join(words(x)) + "\n")
+
+
 def main() -> int:
+    if sys.argv[1] == "xf":
+        xf(Path(sys.argv[2]))
+        return 0
     out = Path(sys.argv[1])
     rng = np.random.default_rng(11)
     cases = []

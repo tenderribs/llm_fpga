@@ -77,7 +77,29 @@ def main() -> int:
     rng = np.random.default_rng(7)
     for c in CASES:
         print(gen(out, *c, rng))
+    chain(out)
     return 0
+
+
+def chain(out: Path):
+    """chain48_37/y.hex: the vector unit's softmax of s48_37's scores (scaled
+    by 1 / sqrt(48)) as the weights for w48_37's V, for tb_llm_core"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from gen_vpu import softmax_scaled
+    scores = np.array([int(l, 16) for l in open(out / "s48_37/y.hex")], np.uint32).view(f32)[:37]
+    rows = [int(l, 16) for l in open(out / "w48_37/beats.hex")]
+    v = np.array([[(r >> (32 * k)) & 0xFFFFFFFF for k in range(8)] for r in rows],
+                 np.uint32).view(f32).reshape(37, 48)
+    a = softmax_scaled(scores, f32(np.sqrt(f32(48))))
+    y = np.empty(48, f32)
+    for i in range(48):
+        acc = f32(0.0)
+        for t in range(37):
+            acc = f32(acc + f32(a[t] * v[t, i]))
+        y[i] = acc
+    d = out / "chain48_37"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "y.hex").write_text("\n".join(hexw(y)) + "\n")
 
 
 if __name__ == "__main__":
