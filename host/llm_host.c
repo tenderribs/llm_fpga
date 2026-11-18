@@ -13,8 +13,9 @@
 //   -p port   serial port (default /dev/ttyUSB0)
 //   -u        always upload the weights over the UART
 //   -n        never upload: the weights are already in DDR
-//             (default: upload unless the FPGA loaded an image of exactly the
-//             right size from the microSD card at boot)
+//             (default: upload unless DDR holds a model image of this model,
+//             host/build_image.py, or the FPGA loaded bare weights of exactly
+//             the right size from the microSD card at boot)
 //   -s        after uploading, store the weights on the microSD card, so the
 //             FPGA loads them by itself at power-on
 //   -v        also run each matmul on the CPU and compare
@@ -168,6 +169,15 @@ static void fpga_write(uint32_t addr, const uint8_t *data, size_t len) {
     if (ack != 0x01) die("bad write ack");
 }
 
+static void fpga_read(uint32_t addr, uint8_t *data, size_t len) {
+    uint8_t hdr[9];
+    hdr[0] = 0x02;
+    put_u32(hdr + 1, addr);
+    put_u32(hdr + 5, (uint32_t)(len / BEAT));
+    ser_write(hdr, sizeof(hdr));
+    ser_read(data, len, 5000);
+}
+
 // ---------------------------------------------------------------------------
 // Weights in DDR
 // ---------------------------------------------------------------------------
@@ -245,6 +255,43 @@ static void place_all(Transformer *t, int upload) {
         fprintf(stderr, "\ruploaded %.1f MB of weights to DDR3 in %.0f s\n", uploaded / 1e6, now() - t0);
 }
 
+// A model image in DDR (host/build_image.py, fw/model/model.h) lists its
+// matrices in place_all()'s order: use those addresses if it is this model.
+static int use_model_image(Transformer *t) {
+    uint8_t h[4096];
+    fpga_read(0, h, sizeof(h));
+    if (memcmp(h, "LLMMODEL", 8) != 0) return 0;
+    int32_t c[8];
+    uint32_t n_mats;
+    memcpy(c, h + 16, sizeof(c));
+    memcpy(&n_mats, h + 76, 4);
+    Config *p = &t->config;
+    if (c[0] != p->dim || c[1] != p->hidden_dim || c[2] != p->n_layers || c[3] != p->n_heads ||
+        c[4] != p->n_kv_heads || c[5] != p->vocab_size || c[7] != GS ||
+        n_mats != (uint32_t)p->n_layers * 7 + 1 || 84 + 4 * n_mats > sizeof(h))
+        return 0;
+    TransformerWeights *w = &t->weights;
+    const QuantizedTensor *order[256];
+    int k = 0;
+    for (int l = 0; l < p->n_layers; l++) {
+        order[k++] = w->wq + l;
+        order[k++] = w->wk + l;
+        order[k++] = w->wv + l;
+        order[k++] = w->wo + l;
+        order[k++] = w->w1 + l;
+        order[k++] = w->w2 + l;
+        order[k++] = w->w3 + l;
+    }
+    order[k++] = w->wcls;
+    g_naddrs = 0;
+    for (int i = 0; i < k; i++) {
+        g_addrs[i].q = order[i]->q;
+        memcpy(&g_addrs[i].addr, h + 84 + 4 * i, 4);
+    }
+    g_naddrs = k;
+    return 1;
+}
+
 static uint32_t addr_of(const QuantizedTensor *w) {
     for (int i = 0; i < g_naddrs; i++)
         if (g_addrs[i].q == w->q) return g_addrs[i].addr;
@@ -313,6 +360,11 @@ int main(int argc, char **argv) {
     if (!st.calibrated) die("DDR3 not calibrated");
     place_all(&transformer, 0);  // lay out the addresses only
     uint32_t image_bytes = g_next_addr;
+    if (upload <= 0 && use_model_image(&transformer)) {
+        fprintf(stderr, "using the model image in DDR\n");
+        upload = 0;
+        store = 0;
+    }
     if (upload < 0) {
         upload = !(st.sd_ok && st.sd_bytes == image_bytes);
         fprintf(stderr, upload ? "no matching image loaded from the microSD card: uploading\n"
