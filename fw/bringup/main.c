@@ -2,10 +2,11 @@
 // and the matmul engine. Prints a report on the console (UART) and ends with
 // "BRINGUP PASS" or "BRINGUP FAIL".
 //
-// The matmul test needs the stories15M image on the microSD card (stored
-// with host/llm_host -s): it runs layer 0's wq (288x288, at DDR offset 0) on
-// the engine, then the same matmul in software on the CPU's FPU, the way
-// runq.c does it, and compares the two bit for bit.
+// The matmul test needs a stories15M image in DDR (from the microSD card):
+// a model image (host/build_image.py), or the older bare weights (host/llm_host
+// -s) with layer 0's wq at offset 0. It runs layer 0's wq (288x288) on the
+// engine, then the same matmul in software on the CPU's FPU, the way runq.c
+// does it, and compares the two bit for bit.
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -76,7 +77,7 @@ int main(void) {
     printf("\n=== top_soc bring-up: MicroBlaze V ===\n");
     check(LLM_ID == 0x314D4C4Cu, "llm_core ID register");
 
-    // CPU clock vs the core's cycle counter (both should be the 225 MHz clock)
+    // CPU clock vs the core's cycle counter: expect a 150 : 225 ratio
     uint32_t c0 = rdcycle(), t0 = LLM_CYCLES;
     for (volatile int i = 0; i < 100000; i++) {}
     uint32_t c1 = rdcycle(), t1 = LLM_CYCLES;
@@ -116,10 +117,16 @@ int main(void) {
         for (int i = 0; i < N; i++) xq[i] = (int8_t)((i * 37 + 11) % 255 - 127);
         for (int g = 0; g < N / 32; g++) xs[g] = 0.01f * (float)(g + 1);
 
+        // a model image's header lists the matrices (fw/model/model.h)
+        uint32_t w_off = 0;
+        if (memcmp((const void *)DDR_BASE, "LLMMODEL", 8) == 0)
+            w_off = *(const volatile uint32_t *)(DDR_BASE + 84);  // mat_off[0]
+        printf("layer 0 wq at DDR offset 0x%08lx\n", (unsigned long)w_off);
+
         uint32_t h0 = LLM_CYCLES;
-        matmul_hw(y_hw, xq, xs, 0, N, D);
+        matmul_hw(y_hw, xq, xs, w_off, N, D);
         uint32_t h1 = LLM_CYCLES;
-        matmul_sw(y_sw, xq, xs, (const uint8_t *)DDR_BASE, N, D);
+        matmul_sw(y_sw, xq, xs, (const uint8_t *)(DDR_BASE + w_off), N, D);
         uint32_t h2 = LLM_CYCLES;
 
         int diff = 0;
