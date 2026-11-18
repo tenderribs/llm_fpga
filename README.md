@@ -275,6 +275,39 @@ loads the model from the microSD card (~7 s) and waits for prompts from
 writing, the FPGA was rebooted from the flash over JTAG and worked; a boot
 from an actual power cycle has not been tried yet.
 
+## Performance: the FPGA vs a desktop CPU
+
+stories15M (int8), greedy, prompt "Once upon a time", generating until the
+story ends. Board: `host/chat.py`, timed by the firmware. Host: llama2.c's
+`runq.c` on an AMD Ryzen 7 3700X (8 cores, up to 4.4 GHz, gcc 13), median of
+7 runs, at the same length as the board's story (168 tokens).
+
+| Platform | Build | tokens/s |
+|---|---|---|
+| FPGA board: MicroBlaze V at 150 MHz, engine and attention unit at 225 MHz | this repo | **32** |
+| Ryzen 7 3700X, 1 thread | `runq.c`, `gcc -O2` (bit-exact build) | 108 |
+| Ryzen 7 3700X, 1 thread | `runq.c`, `gcc -Ofast -march=native` | 250 |
+| Ryzen 7 3700X, 8 threads | `runq.c`, `-Ofast -march=native -fopenmp` | 1465 |
+
+The desktop is 3.4x faster on one core and about 45x faster on all eight;
+it also runs at a ~30x higher clock. The board's time per token is ~17 ms of
+float work on the 150 MHz CPU (quantize, SwiGLU, RoPE), ~5 ms of matmuls and
+4-13 ms of attention; the engine streams the 17 MB of weights per token in
+about 3 ms. Without the engine and attention unit, the MicroBlaze V alone
+would manage about 1 token/s (from bring-up's 288x288 matmul on the CPU).
+Power wasn't measured.
+
+How the board's speed developed (same model and prompt):
+
+| Step | tokens/s |
+|---|---|
+| Host PC runs the model, one matmul at a time over the USB-UART (`top_llm`) | 0.7 |
+| MicroBlaze V runs the model, matmuls on the engine | 4.7 |
+| Hot buffers in local memory; attention loops overlapped | 7.3 |
+| 5-stage CPU pipeline, 32 KB write-back data cache | 11.3 |
+| fp32 attention unit | 19.7 |
+| Results over the local memory bus, argmax in hardware | 32 |
+
 ## Status and next steps
 
 Measured on the board (stories15M, greedy, `host/chat.py`): 31-38 tokens/s
