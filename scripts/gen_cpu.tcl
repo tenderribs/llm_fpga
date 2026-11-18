@@ -2,8 +2,11 @@
 # Run through the Makefile (make cpu).
 #
 #   MicroBlaze V: RV32IMF (single-precision FPU, multiply / divide),
-#     frequency-optimized pipeline, 8 KB instruction + 8 KB data cache over
-#     DDR, debug module (load and debug firmware over JTAG with xsdb)
+#     5-stage (performance) pipeline with a branch target cache, 8 KB
+#     instruction cache and 32 KB write-back data cache over DDR (64-byte
+#     lines, one line-wide AXI transfer each), debug module (load and debug
+#     firmware over JTAG with xsdb). The data cache is write-back: nothing
+#     else reads what the CPU writes to DDR (the engine only reads weights).
 #   256 KB local memory (LMB block RAM) for code, data and stack
 #   SmartConnect: CPU caches, the CPU's uncached port and the external
 #     master (llm_core's weight reader / SD / UART path) to DDR; the CPU's
@@ -70,14 +73,18 @@ set mbv [create_bd_cell -type ip -vlnv xilinx.com:ip:microblaze_riscv:1.0 mbv]
 set_property -dict [list \
     CONFIG.C_USE_FPU 1 \
     CONFIG.C_USE_MULDIV 2 \
-    CONFIG.C_OPTIMIZATION 2 \
+    CONFIG.C_OPTIMIZATION 0 \
+    CONFIG.C_USE_BRANCH_TARGET_CACHE 1 \
     CONFIG.C_D_AXI 1 \
     CONFIG.C_D_LMB 1 \
     CONFIG.C_I_LMB 1 \
     CONFIG.C_USE_ICACHE 1 \
     CONFIG.C_USE_DCACHE 1 \
     CONFIG.C_ICACHE_BYTE_SIZE 8192 \
-    CONFIG.C_DCACHE_BYTE_SIZE 8192 \
+    CONFIG.C_DCACHE_BYTE_SIZE 32768 \
+    CONFIG.C_DCACHE_LINE_LEN 16 \
+    CONFIG.C_DCACHE_DATA_WIDTH 1 \
+    CONFIG.C_DCACHE_USE_WRITEBACK 1 \
     CONFIG.C_ICACHE_BASEADDR 0x0000000080000000 \
     CONFIG.C_ICACHE_HIGHADDR 0x000000009FFFFFFF \
     CONFIG.C_DCACHE_BASEADDR 0x0000000080000000 \

@@ -8,7 +8,7 @@ Current state: stories15M runs entirely on the board. A MicroBlaze V soft
 CPU on the FPGA runs `runq.c`'s forward pass (`fw/`), and an int8
 matrix-vector engine in the fabric does every matmul, streaming the weights
 from DDR3. The model is stored on a microSD card in the board's slot and
-loaded at power-on. Greedy generation runs at about 7 tokens/s, and every
+loaded at power-on. Greedy generation runs at about 11 tokens/s, and every
 step's logits are bit-identical to an x86 build of the same firmware code.
 That x86 build, with the C library's math functions instead of the
 firmware's, is bit-identical to llama2.c's `runq.c`.
