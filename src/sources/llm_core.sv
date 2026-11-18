@@ -17,6 +17,8 @@
 //                                        image into DDR (see sd_ctrl.sv)
 //   0x05 SD_STORE addr:u32 nbytes:u32    reply 0x05, then copy nbytes of DDR
 //                                        at addr to the microSD card
+//   0x06 CONSOLE_IN n:u8 bytes           n bytes for the CPU (CONSOLE_IN
+//                                        register); no reply
 // STATUS reply, 12 bytes:
 //   "LLM", flags, sd_err_code, sd_last_r1, 0, 0, sd_image_bytes:u32
 //   flags: 0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error, 4 card detect pin
@@ -28,6 +30,9 @@
 //   0x00004 STATUS      0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error,
 //                       7:4 SD error code, 8 matmul busy, 9 console full
 //   0x00008 CONSOLE     W: byte to send on the UART (dropped when full)
+//   0x0000C CONSOLE_IN  R: bit 8 set: bits 7:0 are the next byte the host
+//                       sent with CONSOLE_IN (the read takes it); clear:
+//                       nothing waiting
 //   0x00010 MM_ADDR     W (DDR address, from 0) in qmv DDR format
 //   0x00014 MM_ND       n | d << 16
 //   0x00018 MM_START    any write: run y = W @ x; results go to Y
@@ -39,13 +44,19 @@
 //   0x00034 AT_CFG      head_size | timesteps << 16
 //   0x00038 AT_START    write 0: scores q.k_t into Y[t]; write 1: weighted
 //                       sum a.V into Y[i]
+//   0x0003C ARGMAX      R: index of the largest result of the last CPU
+//                       matmul (the first one if tied, like a C loop
+//                       with >; -0 == +0)
 //   0x01000 XQ          W: x.q, word i = bytes 4i..4i+3 (write in order;
 //                       every 8th word completes a 32-byte line)
 //   0x01800 XS          W: x.s, word g = the scale of group g
 //   0x04000 AT_A        W: attention's A RAM, word i: q[i] (scores) or
 //                       a[t] (weighted sum), up to 4096 words
 //   0x20000 Y           R: y, word i = row i (up to 32768 rows)
-// STATUS bit 8 (busy) covers attention jobs too.
+// STATUS bit 8 (busy) covers attention jobs too; bit 10: CONSOLE_IN has a
+// byte.
+// The Y RAM can also be read through yb_* (a block RAM port on another
+// clock: the CPU's local memory bus, reads one cycle after yb_en_i).
 // The console is sent only between UART commands, so host tools and
 // firmware output don't interleave mid-reply. A CPU matmul starts when no
 // UART command is running and holds off new ones until it is done.
@@ -112,7 +123,13 @@ module llm_core #(
     output logic s_arready_o,
     output logic [31:0] s_rdata_o,
     output logic s_rvalid_o,
-    input wire logic s_rready_i
+    input wire logic s_rready_i,
+
+    // Y RAM read port (CPU local memory bus), byte address, its own clock
+    input wire logic yb_clk_i,
+    input wire logic yb_en_i,
+    input wire logic [31:0] yb_addr_i,
+    output logic [31:0] yb_dout_o
 );
 
   localparam int P = 32;
@@ -227,7 +244,8 @@ module llm_core #(
     OP_READ   = 8'h02,
     OP_MATMUL = 8'h03,
     OP_SD_LOAD = 8'h04,
-    OP_SD_STORE = 8'h05
+    OP_SD_STORE = 8'h05,
+    OP_CONSOLE_IN = 8'h06
   } op_t;
 
   // ---------------------------------------------------------------------------
@@ -295,7 +313,8 @@ module llm_core #(
     S_SD_ACK,     // reply to SD_LOAD / SD_STORE
     S_CPU_PREP,   // CPU matmul / attention: wait for the beat count
     S_CPU_RUN,    // CPU matmul: running, results to the Y RAM
-    S_CPU_ATT     // CPU attention job: running, results to the Y RAM
+    S_CPU_ATT,    // CPU attention job: running, results to the Y RAM
+    S_CIN         // CONSOLE_IN: receiving bytes for the CPU
   } state_t;
   state_t state_q;
 
@@ -481,13 +500,14 @@ module llm_core #(
   always_comb begin
     case (op_q)
       OP_WRITE, OP_READ, OP_MATMUL, OP_SD_STORE: hdr_len = 4'd8;
+      OP_CONSOLE_IN: hdr_len = 4'd1;
       default: hdr_len = 4'd0;
     endcase
   end
 
   // Only time out while partway through receiving a command
   assign waiting_for_rx = (state_q == S_HDR) || (state_q == S_WR_DATA)
-                          || (state_q == S_MM_XQ) || (state_q == S_MM_XS);
+                          || (state_q == S_MM_XQ) || (state_q == S_MM_XS) || (state_q == S_CIN);
   assign timeout = waiting_for_rx && !rx_valid
                    && (idle_q == ($clog2(IdleTimeoutClks))'(IdleTimeoutClks - 1));
 
@@ -627,6 +647,7 @@ module llm_core #(
               op_q <= op_t'(rx_data);
               case (rx_data)
                 OP_STATUS: state_q <= S_STATUS;
+                OP_CONSOLE_IN: state_q <= S_HDR;
                 // the rest only when no SD operation owns the DDR
                 OP_WRITE, OP_READ, OP_MATMUL, OP_SD_STORE: if (!sd_busy) state_q <= S_HDR;
                 OP_SD_LOAD: begin
@@ -698,6 +719,10 @@ module llm_core #(
                   count_q <= hdr_w1;
                   state_q <= (hdr_w1 == 0) ? S_OP : S_RD_ADDR;
                 end
+                OP_CONSOLE_IN: begin
+                  count_q <= 32'(rx_buf_q[31]);
+                  state_q <= (rx_buf_q[31] == 8'd0) ? S_OP : S_CIN;
+                end
                 OP_SD_STORE: begin
                   sd_store_addr_q <= hdr_w0;
                   sd_store_bytes_q <= hdr_w1;
@@ -713,6 +738,13 @@ module llm_core #(
                   state_q <= S_MM_XQ;
                 end
               endcase
+            end
+          end
+
+          S_CIN: begin
+            if (rx_valid) begin
+              count_q <= count_q - 1;
+              if (count_q == 1) state_q <= S_OP;
             end
           end
 
@@ -864,14 +896,61 @@ module llm_core #(
       .full_o (cons_full)
   );
 
+  logic [$clog2(YWords)-1:0] yidx_q;  // where the next CPU matmul result goes
+
+  // bytes from the host for the CPU (CONSOLE_IN)
+  logic cin_empty, cin_full, cin_pop;
+  logic [7:0] cin_data;
+  fifo #(
+      .Width(8),
+      .Depth(1024)
+  ) u_console_in (
+      .clk_i  (clk_i),
+      .rst_ni (rst_ni),
+      .clear_i(1'b0),
+      .we_i   (state_q == S_CIN && rx_valid && !cin_full),
+      .wdata_i(rx_data),
+      .re_i   (cin_pop),
+      .rdata_o(cin_data),
+      .empty_o(cin_empty),
+      .full_o (cin_full)
+  );
+
+  // argmax of the CPU matmul's results, in row order: ordered keys for the
+  // floats (-0 as +0), the first of equal maxima kept
+  function automatic logic [31:0] fkey(input logic [31:0] f);
+    if (f[30:0] == '0) return 32'h8000_0000;
+    return f[31] ? ~f : {1'b1, f[30:0]};
+  endfunction
+  logic am_valid_q;
+  logic [31:0] am_key_q;
+  logic [15:0] am_idx_q;
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) begin
+      am_valid_q <= 1'b0;
+      am_key_q <= '0;
+      am_idx_q <= '0;
+    end else if (state_q == S_CPU_PREP) begin
+      am_valid_q <= 1'b0;
+    end else if (y_valid && cpu_mm_q) begin
+      if (!am_valid_q || fkey(y) > am_key_q) begin
+        am_key_q <= fkey(y);
+        am_idx_q <= 16'(yidx_q);
+      end
+      am_valid_q <= 1'b1;
+    end
+  end
+
   // result RAM
   logic [31:0] yram[YWords];
-  logic [$clog2(YWords)-1:0] yidx_q;
   logic [31:0] yram_rdata;
   always_ff @(posedge clk_i) begin
     if ((y_valid && cpu_mm_q) || at_y_valid)
       yram[at_y_valid ? $clog2(YWords)'(at_y_idx) : yidx_q] <= at_y_valid ? at_y : y;
     yram_rdata <= yram[s_araddr_i[$clog2(YWords)+1:2]];
+  end
+  always_ff @(posedge yb_clk_i) begin
+    if (yb_en_i) yb_dout_o <= yram[yb_addr_i[$clog2(YWords)+1:2]];
   end
   always_ff @(posedge clk_i, negedge rst_ni) begin
     if (~rst_ni) yidx_q <= '0;
@@ -949,6 +1028,7 @@ module llm_core #(
   logic rd_pend_q;
   logic [17:0] raddr_q;
   assign s_arready_o = !rd_pend_q && !s_rvalid_o;
+  assign cin_pop = rd_pend_q && (raddr_q == 18'h0000C) && !cin_empty;
 
   always_ff @(posedge clk_i, negedge rst_ni) begin
     if (~rst_ni) begin
@@ -967,14 +1047,17 @@ module llm_core #(
           case (raddr_q)
             18'h00000: s_rdata_o <= 32'h314D_4C4C;  // "LLM1"
             18'h00004:
-            s_rdata_o <= {22'd0, cons_full, cpu_start_q || cpu_mm_q || cpu_at_start_q || cpu_at_q,
+            s_rdata_o <= {21'd0, !cin_empty, cons_full,
+                          cpu_start_q || cpu_mm_q || cpu_at_start_q || cpu_at_q,
                           sd_err_code, sd_err, sd_ok,
                           sd_busy, calib_done_i};
             18'h00010: s_rdata_o <= cpu_addr_q;
             18'h00014: s_rdata_o <= cpu_nd_q;
             18'h0001C: s_rdata_o <= sd_img_bytes;
             18'h00020: s_rdata_o <= sd_img_addr;
+            18'h0000C: s_rdata_o <= {23'd0, !cin_empty, cin_data};
             18'h00024: s_rdata_o <= cycles_q;
+            18'h0003C: s_rdata_o <= {16'd0, am_idx_q};
             18'h00030: s_rdata_o <= cpu_at_addr_q;
             18'h00034: s_rdata_o <= cpu_at_cfg_q;
             default:   s_rdata_o <= 32'd0;

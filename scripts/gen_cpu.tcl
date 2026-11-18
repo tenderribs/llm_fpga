@@ -14,6 +14,8 @@
 #
 # Address map (CPU and S_AXI_EXT view):
 #   0x0000_0000  256 KB  local memory (CPU only)
+#   0x0010_0000  128 KB  Y_BRAM: llm_core's result RAM on the data-side LMB
+#                        (CPU only, read at local-memory speed)
 #   0x4000_0000  256 KB  M_AXI_PERIPH: llm_core registers (CPU only)
 #   0x8000_0000    1 GB  M_AXI_DDR: DDR3. The caches cover the lower 512 MB
 #                        (0x8000_0000..0x9FFF_FFFF; the cached range must be
@@ -28,7 +30,8 @@
 #
 # External ports:
 #   clk, resetn, S_AXI_EXT (AXI4, 256-bit), M_AXI_DDR (AXI4, 256-bit),
-#   M_AXI_PERIPH (AXI4-Lite, 32-bit)
+#   M_AXI_PERIPH (AXI4-Lite, 32-bit), Y_BRAM (block RAM port, on the CPU
+#   clock, which it brings out: Y_BRAM_clk)
 
 set repo_root [file normalize [file dirname [info script]]/..]
 set bd_dir    $repo_root/build/cpu_bd
@@ -125,6 +128,15 @@ connect_bd_intf_net [get_bd_intf_pins dlmb/LMB_Sl_0] [get_bd_intf_pins dlmb_ctrl
 connect_bd_intf_net [get_bd_intf_pins ilmb_ctrl/BRAM_PORT] [get_bd_intf_pins lmem/BRAM_PORTA]
 connect_bd_intf_net [get_bd_intf_pins dlmb_ctrl/BRAM_PORT] [get_bd_intf_pins lmem/BRAM_PORTB]
 
+# llm_core's result RAM as a second data-side LMB slave: a block RAM port out
+# of the design (the RAM itself is in llm_core, dual-clock)
+set_property CONFIG.C_LMB_NUM_SLAVES 2 $dlmb
+set ylmb_ctrl [create_bd_cell -type ip -vlnv xilinx.com:ip:lmb_bram_if_cntlr:4.0 ylmb_ctrl]
+connect_bd_intf_net [get_bd_intf_pins dlmb/LMB_Sl_1] [get_bd_intf_pins ylmb_ctrl/SLMB]
+set ybram [create_bd_intf_port -mode Master -vlnv xilinx.com:interface:bram_rtl:1.0 Y_BRAM]
+set_property -dict [list CONFIG.MASTER_TYPE BRAM_CTRL CONFIG.READ_WRITE_MODE READ_WRITE] $ybram
+connect_bd_intf_net [get_bd_intf_pins ylmb_ctrl/BRAM_PORT] $ybram
+
 # ---------------------------------------------------------------------------
 # Interconnect
 # ---------------------------------------------------------------------------
@@ -149,11 +161,12 @@ connect_bd_net [get_bd_pins cpu_clk_gen/locked] [get_bd_pins rst/dcm_locked]
 connect_bd_net [get_bd_pins cpu_clk_gen/clk_out1] [get_bd_pins mbv/Clk] \
     [get_bd_pins ilmb/LMB_Clk] [get_bd_pins dlmb/LMB_Clk] \
     [get_bd_pins ilmb_ctrl/LMB_Clk] [get_bd_pins dlmb_ctrl/LMB_Clk] [get_bd_pins sc/aclk] \
+    [get_bd_pins ylmb_ctrl/LMB_Clk] \
     [get_bd_pins rst/slowest_sync_clk]
 connect_bd_net [get_bd_pins mdm/Debug_SYS_Rst] [get_bd_pins rst/mb_debug_sys_rst]
 connect_bd_net [get_bd_pins rst/mb_reset] [get_bd_pins mbv/Reset]
 connect_bd_net [get_bd_pins rst/bus_struct_reset] [get_bd_pins ilmb/SYS_Rst] [get_bd_pins dlmb/SYS_Rst] \
-    [get_bd_pins ilmb_ctrl/LMB_Rst] [get_bd_pins dlmb_ctrl/LMB_Rst]
+    [get_bd_pins ilmb_ctrl/LMB_Rst] [get_bd_pins dlmb_ctrl/LMB_Rst] [get_bd_pins ylmb_ctrl/LMB_Rst]
 connect_bd_net [get_bd_pins rst/interconnect_aresetn] [get_bd_pins sc/aresetn]
 connect_bd_intf_net [get_bd_intf_pins mdm/MBDEBUG_0] [get_bd_intf_pins mbv/DEBUG]
 
@@ -162,6 +175,7 @@ connect_bd_intf_net [get_bd_intf_pins mdm/MBDEBUG_0] [get_bd_intf_pins mbv/DEBUG
 # ---------------------------------------------------------------------------
 assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs ilmb_ctrl/SLMB/Mem]
 assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs dlmb_ctrl/SLMB/Mem]
+assign_bd_address -offset 0x00100000 -range 128K [get_bd_addr_segs ylmb_ctrl/SLMB/Mem]
 foreach space {mbv/Instruction mbv/Data} {
     assign_bd_address -target_address_space [get_bd_addr_spaces $space] \
         -offset 0x80000000 -range 1G [get_bd_addr_segs M_AXI_DDR/Reg]
