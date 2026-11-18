@@ -340,7 +340,8 @@ module llm_core #(
     S_CIN,        // CONSOLE_IN: receiving bytes for the CPU
     S_CPU_VPU,    // CPU vector unit job: running
     S_DMA_RD,     // DMA job: reading V words
-    S_DMA_AXI     // DMA job: one beat on AW / W, waiting for B
+    S_DMA_AXI,    // DMA job: one beat on AW / W
+    S_DMA_DRAIN   // DMA job: waiting for the last write responses
   } state_t;
   state_t state_q;
 
@@ -397,6 +398,11 @@ module llm_core #(
   end
   logic [31:0] dma_strb_q;
   logic dma_stride4_q;
+  // writes are not waited for one by one: up to DmaOut in flight
+  localparam int DmaOut = 15;
+  logic [4:0] dma_bout_q;
+  logic dma_state, dma_aw_fire, dma_b_fire;
+  assign dma_state = (state_q == S_DMA_RD) || (state_q == S_DMA_AXI) || (state_q == S_DMA_DRAIN);
 
   // its DDR beats from AT_CFG (stable long before the job starts)
   logic [11:0] at_nblk_q;
@@ -610,12 +616,20 @@ module llm_core #(
   // AXI write: one beat at a time
   assign c_awaddr  = {addr_q[AddrW-1:5], 5'd0};  // DMA words: the strobes pick the bytes
   assign c_awlen   = 8'd0;
-  assign c_awvalid = (state_q == S_WR_AXI || state_q == S_DMA_AXI) && !aw_done_q;
+  assign c_awvalid = ((state_q == S_WR_AXI) || (state_q == S_DMA_AXI && dma_bout_q < 5'(DmaOut)))
+                     && !aw_done_q;
   assign c_wdata   = beat_q;
   assign c_wstrb   = (state_q == S_DMA_AXI) ? dma_strb_q : '1;
   assign c_wlast   = 1'b1;
-  assign c_wvalid  = (state_q == S_WR_AXI || state_q == S_DMA_AXI) && !w_done_q;
-  assign c_bready  = (state_q == S_WR_AXI || state_q == S_DMA_AXI);
+  assign c_wvalid  = ((state_q == S_WR_AXI) || (state_q == S_DMA_AXI && dma_bout_q < 5'(DmaOut)))
+                     && !w_done_q;
+  assign c_bready  = (state_q == S_WR_AXI) || dma_state;
+  assign dma_aw_fire = (state_q == S_DMA_AXI) && c_awvalid && c_awready;
+  assign dma_b_fire  = dma_state && c_bvalid;
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) dma_bout_q <= '0;
+    else dma_bout_q <= dma_bout_q + 5'(dma_aw_fire) - 5'(dma_b_fire);
+  end
 
   // AXI read: single beats for READ, otherwise the weight reader
   always_comb begin
@@ -821,7 +835,8 @@ module llm_core #(
           S_DMA_AXI: begin
             if (c_awvalid && c_awready) aw_done_q <= 1'b1;
             if (c_wvalid && c_wready) w_done_q <= 1'b1;
-            if (c_bvalid) begin
+            // both sent (this cycle or before): on to the next beat
+            if ((aw_done_q || (c_awvalid && c_awready)) && (w_done_q || (c_wvalid && c_wready))) begin
               dma_iss_q <= '0;
               dma_got_q <= '0;
               if (dma_stride4_q) begin
@@ -831,12 +846,14 @@ module llm_core #(
                 addr_q <= addr_q + AddrW'(cpu_dma_stride_q);
                 count_q <= count_q - 1;
               end
-              if (count_q == (dma_stride4_q ? 32'd8 : 32'd1)) begin
-                jobs_q <= jobs_q + 1;
-                state_q <= S_OP;
-              end else begin
-                state_q <= S_DMA_RD;
-              end
+              state_q <= (count_q == (dma_stride4_q ? 32'd8 : 32'd1)) ? S_DMA_DRAIN : S_DMA_RD;
+            end
+          end
+
+          S_DMA_DRAIN: begin
+            if (dma_bout_q == 5'(dma_b_fire)) begin
+              jobs_q <= jobs_q + 1;
+              state_q <= S_OP;
             end
           end
 
@@ -1284,7 +1301,7 @@ module llm_core #(
             s_rdata_o <= {21'd0, !cin_empty, cons_full,
                           cpu_start_q || cpu_mm_q || cpu_at_start_q || cpu_at_q ||
                           cpu_vpu_start_q || cpu_vpu_q || cpu_dma_start_q ||
-                          state_q == S_DMA_RD || state_q == S_DMA_AXI,
+                          dma_state,
                           sd_err_code, sd_err, sd_ok,
                           sd_busy, calib_done_i};
             18'h00010: s_rdata_o <= cpu_addr_q;
