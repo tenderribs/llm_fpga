@@ -25,3 +25,9 @@ set_property -dict { PACKAGE_PIN W23   IOSTANDARD LVCMOS33 } [get_ports { led_o[
 ## synchronizers in the RTL, so there is no I/O timing to check on any of them.
 set_false_path -from [get_ports { cpu_resetn uart_rx_i }]
 set_false_path -to   [get_ports { uart_tx_o led_o[*] }]
+
+## Configuration from the board's quad-SPI flash (make flash): 4-bit SPI,
+## compressed bitstream, faster configuration clock
+set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 4 [current_design]
+set_property BITSTREAM.CONFIG.CONFIGRATE 33 [current_design]
+set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]

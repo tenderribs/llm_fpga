@@ -8,9 +8,10 @@ Current state: stories15M runs entirely on the board. A MicroBlaze V soft
 CPU on the FPGA runs `runq.c`'s forward pass (`fw/`). In the fabric, an int8
 matrix-vector engine does every matmul, streaming the weights from DDR3, and
 an fp32 attention unit computes the attention scores and weighted sums. The
-model is stored on a microSD card in the board's slot and loaded at
-power-on. Greedy generation runs at about 20 tokens/s, and every
-step's logits are bit-identical to an x86 build of the same firmware code.
+design and firmware boot from the board's flash, the model loads from a
+microSD card in the board's slot, and prompts come from the PC over the
+USB-UART (`host/chat.py`). Greedy generation runs at about 30 tokens/s, and
+every step's logits are bit-identical to an x86 build of the same firmware.
 That x86 build, with the C library's math functions instead of the
 firmware's, is bit-identical to llama2.c's `runq.c`.
 
@@ -86,9 +87,13 @@ beats.
   firmware, stack and hot buffers. A data cache covers DDR3. The
   SmartConnect crosses to the 225 MHz side.
 - `llm_core` is shared: the UART command set still works, and the CPU drives
-  the engine through registers (x in, y out, see `llm_core.sv`), with its
-  console output on the same UART.
-- Address map (CPU): local memory at 0, `llm_core` at `0x4000_0000`, DDR3 at
+  the engine through registers (x in, start, see `llm_core.sv`), with its
+  console on the same UART (output, and prompts in with the CONSOLE_IN
+  command). The result RAM is also on the CPU's local memory bus, so
+  results come back at local-memory speed, and the classifier's argmax is
+  computed in hardware as the logits come out.
+- Address map (CPU): local memory at 0, `llm_core`'s result RAM at
+  `0x0010_0000`, `llm_core`'s registers at `0x4000_0000`, DDR3 at
   `0x8000_0000` (cached up to `0x9FFF_FFFF`, uncached above).
 
 ![One token's forward pass, coloured by what runs each step: CPU, matmul engine or attention unit](docs/diagrams/token_flow.drawio.svg)
@@ -246,24 +251,49 @@ python3 host/ddr_test.py                 # DDR memory test + matmuls from DDR
 ### `top_soc`: the model on the board's CPU
 
 ```sh
-make TOP=top_soc program
 python3 host/build_image.py models/stories15M_q80.bin \
     third_party/llama2.c/tokenizer.bin models/stories15M.img
+make TOP=top_soc program_fw              # bitstream with the firmware built in
 # once per model (~2 min): DDR over the UART, then the microSD card
 python3 host/image_tool.py upload models/stories15M.img --store
 
-make -C fw                               # firmware (RISC-V gcc from Vivado)
-python3 host/console.py --until 'LLM (DONE|FAIL)' > run.txt &
-xsdb scripts/run_fw.tcl fw/build/llm.elf # load over JTAG and start
+python3 host/chat.py                     # type prompts, the board writes stories
+python3 host/chat.py --steps 100 "Tom and his dog"
 
-make -C fw golden                        # check against the x86 golden
+# check against the x86 golden: every step's token and logits, bit for bit
+make -C fw golden
+python3 host/chat.py --trace "Once upon a time" > run.txt
 fw/build/golden models/stories15M.img "Once upon a time" 256 /tmp > golden.txt
 grep '^T ' run.txt | diff - golden.txt   # identical
 ```
 
-`fw/build/bringup.elf` tests the CPU, FPU, DDR3 and the engine, and
-`fw/build/membench.elf` measures memory latency. The firmware isn't in flash
-yet: it is loaded over JTAG after each programming.
+**Standalone:** `make TOP=top_soc flash` writes that bitstream to the
+board's QSPI flash (erasing what was there). With the mode jumper on QSPI,
+the board then boots by itself at power-on: it configures from the flash,
+loads the model from the microSD card (~7 s) and waits for prompts from
+`host/chat.py`. The flash now holds this design (written 2026-11-18). After
+writing, the FPGA was rebooted from the flash over JTAG and worked; a boot
+from an actual power cycle has not been tried yet.
+
+## Status and next steps
+
+Measured on the board (stories15M, greedy, `host/chat.py`): 31-38 tokens/s
+for a full story; the time per token is about 17 ms of float work on the
+CPU (quantize 6.7, SwiGLU 6.7, RoPE 3), 5 ms of matmuls and 4-13 ms of
+attention (growing with the story's length).
+
+- [ ] Power-on boot from the QSPI flash (needs a power cycle on site; the
+      mode jumper must be on QSPI)
+- [ ] RoPE: its sin / cos depend only on the position, so compute them once
+      per token instead of in every layer (same bits)
+- [ ] Quantize and SwiGLU (divisions and `expf`) in hardware, or several
+      elements at a time on the CPU
+- [ ] Bigger models: stories42M, stories110M (the microSD card has room)
+
+Other firmware (`make -C fw`) is loaded over JTAG onto a running `top_soc`
+(`make TOP=top_soc program`): `xsdb scripts/run_fw.tcl fw/build/bringup.elf`
+tests the CPU, FPU, DDR3 and the engine; `fw/build/membench.elf` measures
+memory latency (output: `python3 host/console.py`).
 
 `top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
 `host/gemm_uart.py`.

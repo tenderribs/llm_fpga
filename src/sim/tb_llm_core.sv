@@ -12,7 +12,9 @@
 //      DDR, SD_LOAD them back, run that matmul again
 //   6. CPU side over AXI4-Lite: ID, console output on the UART, and the
 //      first matmul again with x written through the XQ / XS windows and
-//      every result read back from the Y RAM
+//      every result read back from the Y RAM, then again through the Y
+//      RAM's second port (yb_*), and the ARGMAX register; CONSOLE_IN bytes
+//      from the UART read back through the register
 //   7. attention through the CPU registers (sim/gen_attn.py vectors s48_37
 //      and w48_37): K / V loaded into the memory model, q / a through AT_A,
 //      scores and weighted sum read back from Y, bit-exact
@@ -103,8 +105,35 @@ module tb_llm_core #(
       .s_arready_o(s_arready),
       .s_rdata_o(s_rdata),
       .s_rvalid_o(s_rvalid),
-      .s_rready_i(s_rready)
+      .s_rready_i(s_rready),
+      .yb_clk_i(clk),
+      .yb_en_i(yb_en),
+      .yb_addr_i(yb_addr),
+      .yb_dout_o(yb_dout)
   );
+
+  // a > b for float32 bits (normal numbers and zeros, -0 == +0), by sign and
+  // magnitude (Verilator's $bitstoshortreal loses the sign)
+  function automatic bit fgt(input logic [31:0] a, input logic [31:0] b);
+    logic sa, sb;
+    if (a[30:0] == 0 && b[30:0] == 0) return 0;
+    sa = a[31] && a[30:0] != 0;
+    sb = b[31] && b[30:0] != 0;
+    if (sa != sb) return sb;
+    return sa ? (a[30:0] < b[30:0]) : (a[30:0] > b[30:0]);
+  endfunction
+
+  // the Y RAM's second port: read one word (data one cycle after en)
+  logic yb_en = 0;
+  logic [31:0] yb_addr = '0, yb_dout;
+  task automatic yb_read(input int i, output logic [31:0] d);
+    @(negedge clk);
+    yb_addr = 32'h0010_0000 + 32'(i * 4);
+    yb_en = 1;
+    @(negedge clk);
+    yb_en = 0;
+    d = yb_dout;
+  endtask
 
   // AXI4-Lite master. Drives on the falling edge and checks the ready a moment
   // later (#1, once the slave's combinational ready has settled); a ready
@@ -483,6 +512,49 @@ module tb_llm_core #(
       end
       $display("CPU matmul %0dx%0d through the registers: %0d mismatches", D0, N0, errs);
       errors += errs;
+
+      // the same results through the second port, and the argmax
+      begin
+        int am = 0;
+        errs = 0;
+        for (int i = 1; i < D0; i++)
+          if (fgt(y_exp[i], y_exp[am])) am = i;
+        axil_read(18'h0003C, v);
+        if (v[15:0] != 16'(am)) begin
+          $display("MISMATCH ARGMAX %0d, exp %0d", v[15:0], am);
+          errors++;
+        end
+        for (int i = 0; i < D0; i++) begin
+          yb_read(i, v);
+          if (v !== y_exp[i]) begin
+            if (errs < 5) $display("MISMATCH Y port B [%0d]: got %08h, exp %08h", i, v, y_exp[i]);
+            errs++;
+          end
+        end
+        $display("Y RAM second port: %0d mismatches; argmax row %0d", errs, am);
+        errors += errs;
+      end
+
+      // CONSOLE_IN: bytes from the UART for the CPU
+      begin
+        string cin = "hi!\n";
+        send_byte(8'h06);
+        send_byte(8'(cin.len()));
+        for (int i = 0; i < cin.len(); i++) send_byte(cin[i]);
+        repeat (4 * ClksPerBit * 10) @(posedge clk);
+        for (int i = 0; i <= cin.len(); i++) begin
+          axil_read(18'h0000C, v);
+          if (i < cin.len() && v !== {23'd0, 1'b1, cin[i]}) begin
+            $display("MISMATCH CONSOLE_IN byte %0d: %h", i, v);
+            errors++;
+          end
+          if (i == cin.len() && v[8] !== 1'b0) begin
+            $display("MISMATCH CONSOLE_IN not empty at the end: %h", v);
+            errors++;
+          end
+        end
+        $display("CONSOLE_IN: %0d bytes", cin.len());
+      end
     end
 
     // 7. attention: scores (K at byte 0x180000), then weighted sum (V at 0x1A0000)

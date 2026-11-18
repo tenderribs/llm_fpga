@@ -13,6 +13,7 @@
 #define LLM_ID          REG(0x00000)
 #define LLM_STATUS      REG(0x00004)
 #define LLM_CONSOLE     REG(0x00008)
+#define LLM_CONSOLE_IN  REG(0x0000C)   // bit 8: a byte from the host in 7:0 (read takes it)
 #define LLM_MM_ADDR     REG(0x00010)
 #define LLM_MM_ND       REG(0x00014)
 #define LLM_MM_START    REG(0x00018)
@@ -22,10 +23,14 @@
 #define LLM_AT_ADDR     REG(0x00030)   // attention: K / V address (DDR offset)
 #define LLM_AT_CFG      REG(0x00034)   // head_size | timesteps << 16
 #define LLM_AT_START    REG(0x00038)   // 0: scores, 1: weighted sum
+#define LLM_ARGMAX      REG(0x0003C)   // largest result of the last CPU matmul
 #define LLM_XQ          ((volatile uint32_t *)(LLM_BASE + 0x01000))
 #define LLM_XS          ((volatile uint32_t *)(LLM_BASE + 0x01800))
 #define LLM_AT_A        ((volatile uint32_t *)(LLM_BASE + 0x04000))
 #define LLM_Y           ((volatile uint32_t *)(LLM_BASE + 0x20000))
+// the same Y RAM on the local memory bus: a few cycles per read instead of
+// a round trip through the interconnect
+#define LLM_YL          ((const volatile uint32_t *)0x00100000u)
 
 #define ST_CALIB        (1u << 0)
 #define ST_SD_BUSY      (1u << 1)
@@ -34,6 +39,7 @@
 #define ST_SD_CODE(s)   (((s) >> 4) & 0xF)
 #define ST_MM_BUSY      (1u << 8)   // matmul or attention job
 #define ST_CONS_FULL    (1u << 9)
+#define ST_CONS_IN      (1u << 10)
 
 #define CLK_HZ          225000000u  // llm_core and its CYCLES counter (DDR user clock)
 #define CPU_HZ          150000000u  // the CPU (rdcycle); scripts/gen_cpu.tcl

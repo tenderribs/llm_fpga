@@ -12,6 +12,10 @@ STACK_SIZE = 16K;
 
 SECTIONS
 {
+    /* _start must be at 0, the CPU's reset address (when the firmware is in
+       the bitstream); the toolchain would put a build-id note there */
+    /DISCARD/ : { *(.note.gnu.build-id) }
+
     .text : {
         KEEP(*(.text.start))
         *(.text .text.*)

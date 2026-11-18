@@ -165,7 +165,26 @@ module top_llm #(
       .sd_cs_o(sd_dat3),
       .sd_mosi_o(sd_cmd),
       .sd_miso_i(sd_dat0),
-      .sd_cd_i(sd_cd)
+      .sd_cd_i(sd_cd),
+      // no CPU here
+      .s_awaddr_i('0),
+      .s_awvalid_i(1'b0),
+      .s_awready_o(),
+      .s_wdata_i('0),
+      .s_wvalid_i(1'b0),
+      .s_wready_o(),
+      .s_bvalid_o(),
+      .s_bready_i(1'b1),
+      .s_araddr_i('0),
+      .s_arvalid_i(1'b0),
+      .s_arready_o(),
+      .s_rdata_o(),
+      .s_rvalid_o(),
+      .s_rready_i(1'b1),
+      .yb_clk_i(ui_clk),
+      .yb_en_i(1'b0),
+      .yb_addr_i('0),
+      .yb_dout_o()
   );
 
 endmodule

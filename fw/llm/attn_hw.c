@@ -64,7 +64,7 @@ void att_scores(RunState *s, const Config *p, int l, int kvh, const float *q, fl
     for (int i = 0; i < hs; i++) LLM_AT_A[i] = qw[i];
     run(k_addr(p, l, kvh), hs, nt, 0);
     uint32_t *aw = (uint32_t *)att;
-    for (int t = 0; t < nt; t++) aw[t] = LLM_Y[t];
+    for (int t = 0; t < nt; t++) aw[t] = LLM_YL[t];
 }
 
 void att_wsum(RunState *s, const Config *p, int l, int kvh, const float *att, float *xb, int nt) {
@@ -74,5 +74,5 @@ void att_wsum(RunState *s, const Config *p, int l, int kvh, const float *att, fl
     for (int t = 0; t < nt; t++) LLM_AT_A[t] = aw[t];
     run(v_addr(p, l, kvh), hs, nt, 1);
     uint32_t *xw = (uint32_t *)xb;
-    for (int i = 0; i < hs; i++) xw[i] = LLM_Y[i];
+    for (int i = 0; i < hs; i++) xw[i] = LLM_YL[i];
 }
