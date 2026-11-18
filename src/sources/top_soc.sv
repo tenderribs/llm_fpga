@@ -7,9 +7,12 @@
 //   CPU caches, uncached port ------------------> SmartConnect --> DDR3
 //   CPU uncached port -------------------------> llm_core registers
 //
-// Everything runs on the DDR controller's 225 MHz user clock. The UART is
-// shared: host commands as in top_llm, and the firmware's console output in
-// between (see llm_core.sv). Firmware is loaded over JTAG with xsdb.
+// llm_core and the DDR side run on the DDR controller's 225 MHz user clock;
+// the CPU runs at 150 MHz from a clocking wizard in the block design, and
+// the SmartConnect and the dual-port Y / V RAMs cross between the two. The
+// UART is shared: host commands as in top_llm, and the firmware's console
+// output in between (see llm_core.sv). The firmware is built into the
+// bitstream (make TOP=top_soc fwbit) or loaded over JTAG with xsdb.
 module top_soc #(
     parameter int Baud = 3_000_000
 ) (

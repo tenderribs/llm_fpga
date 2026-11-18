@@ -18,6 +18,11 @@
 //   7. attention through the CPU registers (sim/gen_attn.py vectors s48_37
 //      and w48_37): K / V loaded into the memory model, q / a through AT_A,
 //      scores and weighted sum read back from Y, bit-exact
+//   8. vector unit: x into the V RAM over the local bus, QUANT into the
+//      matmul's x, the first matmul again with its results at MM_YOFF; then
+//      scores, SOFTMAX into the A RAM and the weighted sum
+//   9. DMA: V RAM words to DDR as whole beats, then scattered every 512
+//      bytes with byte strobes
 // The boot-time SD_LOAD (blank card: error 8) is checked through STATUS.
 module tb_llm_core #(
     parameter string VecDir0,  // first matmul vectors

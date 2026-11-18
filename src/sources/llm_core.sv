@@ -28,7 +28,9 @@
 // CPU side (AXI4-Lite slave, s_axil_*), byte offsets:
 //   0x00000 ID          "LLM1" (0x314D4C4C)
 //   0x00004 STATUS      0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error,
-//                       7:4 SD error code, 8 matmul busy, 9 console full
+//                       7:4 SD error code, 8 busy (any CPU job: matmul,
+//                       attention, vector unit, DMA), 9 console full,
+//                       10 CONSOLE_IN has a byte
 //   0x00008 CONSOLE     W: byte to send on the UART (dropped when full)
 //   0x0000C CONSOLE_IN  R: bit 8 set: bits 7:0 are the next byte the host
 //                       sent with CONSOLE_IN (the read takes it); clear:
@@ -50,9 +52,9 @@
 //                       with >; -0 == +0)
 //   0x00044 MM_YOFF     where a CPU matmul's results start in Y (word)
 //   0x00050 VPU_OP      write: run a vector unit job (vpu.sv): bits 1:0 op
-//                       (1 QUANT into the matmul's x, 2 SILU, 3 SOFTMAX
-//                       into the attention unit's A RAM), bit 8: QUANT
-//                       reads the V RAM (else Y)
+//                       (0 COPY V into the attention unit's A RAM, 1 QUANT
+//                       into the matmul's x, 2 SILU, 3 SOFTMAX into the A
+//                       RAM), bit 8: QUANT reads the V RAM (else Y)
 //   0x00054 VPU_N       elements
 //   0x00058 VPU_SRC     source (word in Y or V)
 //   0x0005C VPU_SRC2    SILU: second source (Y)
@@ -70,8 +72,6 @@
 //   0x04000 AT_A        W: attention's A RAM, word i: q[i] (scores) or
 //                       a[t] (weighted sum), up to 4096 words
 //   0x20000 Y           R: y, word i = row i (up to 32768 rows)
-// STATUS bit 8 (busy) covers attention and vector unit jobs too; bit 10:
-// CONSOLE_IN has a byte.
 // yb_* is a block RAM port on another clock, the CPU's local memory bus
 // (data one cycle after yb_en_i): byte address bit 17 clear reads the Y RAM,
 // set reads and writes the V RAM (8192 words, the vector unit's).
