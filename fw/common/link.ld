@@ -1,11 +1,11 @@
-/* MicroBlaze V firmware: code, data and stack in the 128 KB local memory.
+/* MicroBlaze V firmware: code, data and stack in the 256 KB local memory.
    The heap (malloc) is in cached DDR, see syscalls.c. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
 MEMORY
 {
-    LMB (rwx) : ORIGIN = 0x00000000, LENGTH = 128K
+    LMB (rwx) : ORIGIN = 0x00000000, LENGTH = 256K
 }
 
 STACK_SIZE = 16K;

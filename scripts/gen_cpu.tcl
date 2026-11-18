@@ -4,20 +4,26 @@
 #   MicroBlaze V: RV32IMF (single-precision FPU, multiply / divide),
 #     frequency-optimized pipeline, 8 KB instruction + 8 KB data cache over
 #     DDR, debug module (load and debug firmware over JTAG with xsdb)
-#   128 KB local memory (LMB block RAM) for code, data and stack
+#   256 KB local memory (LMB block RAM) for code, data and stack
 #   SmartConnect: CPU caches, the CPU's uncached port and the external
 #     master (llm_core's weight reader / SD / UART path) to DDR; the CPU's
 #     uncached port also reaches llm_core's registers
 #
 # Address map (CPU and S_AXI_EXT view):
-#   0x0000_0000  128 KB  local memory (CPU only)
+#   0x0000_0000  256 KB  local memory (CPU only)
 #   0x4000_0000  256 KB  M_AXI_PERIPH: llm_core registers (CPU only)
 #   0x8000_0000    1 GB  M_AXI_DDR: DDR3. The caches cover the lower 512 MB
 #                        (0x8000_0000..0x9FFF_FFFF; the cached range must be
 #                        a power of two); the upper 512 MB (0xA000_0000..)
 #                        is reached uncached, through the peripheral port.
 #
-# External ports (all on clk, 225 MHz = the DDR controller's user clock):
+# Clocks: the external ports are all on clk (225 MHz, the DDR controller's
+# user clock). The CPU, its local memory and the SmartConnect's CPU-side
+# ports run on cpu_clk (150 MHz, from a clocking wizard fed by clk): the
+# MicroBlaze V pipeline doesn't close timing at 225 MHz on this part. The
+# SmartConnect does the clock crossing.
+#
+# External ports:
 #   clk, resetn, S_AXI_EXT (AXI4, 256-bit), M_AXI_DDR (AXI4, 256-bit),
 #   M_AXI_PERIPH (AXI4-Lite, 32-bit)
 
@@ -25,6 +31,7 @@ set repo_root [file normalize [file dirname [info script]]/..]
 set bd_dir    $repo_root/build/cpu_bd
 set part      xc7k325tffg900-2
 set clk_hz    225000000
+set cpu_mhz   150
 
 file delete -force $bd_dir
 create_project -force cpu_bd $bd_dir -part $part
@@ -83,6 +90,17 @@ set mdm [create_bd_cell -type ip -vlnv xilinx.com:ip:mdm_riscv:1.0 mdm]
 set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst]
 set_property CONFIG.C_EXT_RST_WIDTH 1 $rst
 
+# CPU clock: an MMCM fed by clk (already on a global buffer)
+set cw [create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 cpu_clk_gen]
+set_property -dict [list \
+    CONFIG.PRIM_IN_FREQ [expr {$clk_hz / 1e6}] \
+    CONFIG.PRIM_SOURCE No_buffer \
+    CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $cpu_mhz \
+    CONFIG.USE_RESET true \
+    CONFIG.RESET_TYPE ACTIVE_LOW \
+    CONFIG.USE_LOCKED true \
+] $cw
+
 # ---------------------------------------------------------------------------
 # Local memory: one true dual-port block RAM, I side and D side
 # ---------------------------------------------------------------------------
@@ -104,7 +122,7 @@ connect_bd_intf_net [get_bd_intf_pins dlmb_ctrl/BRAM_PORT] [get_bd_intf_pins lme
 # Interconnect
 # ---------------------------------------------------------------------------
 set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 sc]
-set_property -dict [list CONFIG.NUM_SI 4 CONFIG.NUM_MI 2] $sc
+set_property -dict [list CONFIG.NUM_SI 4 CONFIG.NUM_MI 2 CONFIG.NUM_CLKS 2] $sc
 
 connect_bd_intf_net [get_bd_intf_pins mbv/M_AXI_IC] [get_bd_intf_pins sc/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins mbv/M_AXI_DC] [get_bd_intf_pins sc/S01_AXI]
@@ -116,10 +134,15 @@ connect_bd_intf_net [get_bd_intf_pins sc/M01_AXI] $m_periph
 # ---------------------------------------------------------------------------
 # Clocks, resets, debug
 # ---------------------------------------------------------------------------
-connect_bd_net $clk [get_bd_pins mbv/Clk] [get_bd_pins ilmb/LMB_Clk] [get_bd_pins dlmb/LMB_Clk] \
+# clk (225 MHz): the SmartConnect's external-side ports (S03, M00, M01) via aclk1
+connect_bd_net $clk [get_bd_pins cpu_clk_gen/clk_in1] [get_bd_pins sc/aclk1]
+connect_bd_net $rstn [get_bd_pins cpu_clk_gen/resetn] [get_bd_pins rst/ext_reset_in]
+connect_bd_net [get_bd_pins cpu_clk_gen/locked] [get_bd_pins rst/dcm_locked]
+# cpu_clk (150 MHz): CPU, local memory, the SmartConnect's CPU-side ports via aclk
+connect_bd_net [get_bd_pins cpu_clk_gen/clk_out1] [get_bd_pins mbv/Clk] \
+    [get_bd_pins ilmb/LMB_Clk] [get_bd_pins dlmb/LMB_Clk] \
     [get_bd_pins ilmb_ctrl/LMB_Clk] [get_bd_pins dlmb_ctrl/LMB_Clk] [get_bd_pins sc/aclk] \
     [get_bd_pins rst/slowest_sync_clk]
-connect_bd_net $rstn [get_bd_pins rst/ext_reset_in]
 connect_bd_net [get_bd_pins mdm/Debug_SYS_Rst] [get_bd_pins rst/mb_debug_sys_rst]
 connect_bd_net [get_bd_pins rst/mb_reset] [get_bd_pins mbv/Reset]
 connect_bd_net [get_bd_pins rst/bus_struct_reset] [get_bd_pins ilmb/SYS_Rst] [get_bd_pins dlmb/SYS_Rst] \
@@ -130,8 +153,8 @@ connect_bd_intf_net [get_bd_intf_pins mdm/MBDEBUG_0] [get_bd_intf_pins mbv/DEBUG
 # ---------------------------------------------------------------------------
 # Addresses
 # ---------------------------------------------------------------------------
-assign_bd_address -offset 0x00000000 -range 128K [get_bd_addr_segs ilmb_ctrl/SLMB/Mem]
-assign_bd_address -offset 0x00000000 -range 128K [get_bd_addr_segs dlmb_ctrl/SLMB/Mem]
+assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs ilmb_ctrl/SLMB/Mem]
+assign_bd_address -offset 0x00000000 -range 256K [get_bd_addr_segs dlmb_ctrl/SLMB/Mem]
 foreach space {mbv/Instruction mbv/Data} {
     assign_bd_address -target_address_space [get_bd_addr_spaces $space] \
         -offset 0x80000000 -range 1G [get_bd_addr_segs M_AXI_DDR/Reg]

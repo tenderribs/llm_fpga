@@ -31,4 +31,5 @@
 #define ST_MM_BUSY      (1u << 8)
 #define ST_CONS_FULL    (1u << 9)
 
-#define CLK_HZ          225000000u  // everything runs on the DDR user clock
+#define CLK_HZ          225000000u  // llm_core and its CYCLES counter (DDR user clock)
+#define CPU_HZ          150000000u  // the CPU (rdcycle); scripts/gen_cpu.tcl
