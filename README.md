@@ -5,10 +5,11 @@ models, starting with stories15M) on a Digilent Genesys 2 board (Kintex-7
 `xc7k325tffg900-2`), using llama2.c's int8 "Q8_0" format.
 
 Current state: stories15M runs entirely on the board. A MicroBlaze V soft
-CPU on the FPGA runs `runq.c`'s forward pass (`fw/`), and an int8
-matrix-vector engine in the fabric does every matmul, streaming the weights
-from DDR3. The model is stored on a microSD card in the board's slot and
-loaded at power-on. Greedy generation runs at about 11 tokens/s, and every
+CPU on the FPGA runs `runq.c`'s forward pass (`fw/`). In the fabric, an int8
+matrix-vector engine does every matmul, streaming the weights from DDR3, and
+an fp32 attention unit computes the attention scores and weighted sums. The
+model is stored on a microSD card in the board's slot and loaded at
+power-on. Greedy generation runs at about 20 tokens/s, and every
 step's logits are bit-identical to an x86 build of the same firmware code.
 That x86 build, with the C library's math functions instead of the
 firmware's, is bit-identical to llama2.c's `runq.c`.
@@ -47,6 +48,17 @@ lays `W` out in that order: `qmv_stream()` in `ref/q80.py`.
 `top_qmv` protocol (1 Mbaud): the host sends `n`, `d` (u16), `x.q`, `x.s`,
 then the weight beats (32 int8 + float32 scale each); the FPGA streams back
 `d` float32 results as they are computed. See `src/sources/top_qmv.sv`.
+
+### Attention unit (`attn.sv`)
+
+For one head, the two float loops of `runq.c`'s attention: the scores
+`q · k_t` for every timestep, then the weighted sum `Σ a_t v_t` once the CPU
+has done the softmax. Each sum adds its terms in `runq.c`'s order on the
+engine's fp32 units, so the results are bit-exact. K and V stream from DDR3
+through the weight reader, one multiply-add per cycle. K is stored in blocks
+of 16 timesteps, transposed, so 16 independent sums are in flight and hide
+the adder's latency. The CPU writes the KV cache through the uncached DDR3
+window, so the unit reads exactly what was written.
 
 ### `top_llm`: DDR3, commands, microSD
 
