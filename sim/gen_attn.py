@@ -1,0 +1,84 @@
+"""
+Test vectors for attn.sv (src/sim/tb_attn.sv): one attention job per
+directory, the expected sums computed in float32 in runq.c's order.
+
+  a.hex      the A RAM words (q for scores, the weights a for the weighted sum)
+  beats.hex  the K / V beats as the unit reads them (256-bit, lane 0 in the
+             low 32 bits)
+  y.hex      expected results by index (scores: padded to a multiple of 16)
+
+usage: python3 sim/gen_attn.py OUTDIR   (writes OUTDIR/<case>/ and prints
+       the tb parameters of each case)
+"""
+
+from pathlib import Path
+import sys
+
+import numpy as np
+
+f32 = np.float32
+CASES = [  # name, mode, hs, nt
+    ("s48_37", 0, 48, 37),
+    ("s48_1", 0, 48, 1),
+    ("s64_32", 0, 64, 32),
+    ("w48_37", 1, 48, 37),
+    ("w48_1", 1, 48, 1),
+    ("w64_100", 1, 64, 100),
+    ("w16_20", 1, 16, 20),
+]
+
+
+def hexw(x: np.ndarray) -> list:
+    return [f"{int(u):08x}" for u in x.astype("<f4").view(np.uint32)]
+
+
+def beat_lines(floats: np.ndarray) -> list:
+    """floats (multiple of 8) -> 256-bit hex lines, lane 0 lowest"""
+    w = floats.astype("<f4").view(np.uint32).reshape(-1, 8)
+    return ["".join(f"{int(u):08x}" for u in row[::-1]) for row in w]
+
+
+def gen(out: Path, name: str, mode: int, hs: int, nt: int, rng) -> str:
+    d = out / name
+    d.mkdir(parents=True, exist_ok=True)
+    if mode == 0:
+        nblk = (nt + 15) // 16
+        q = rng.standard_normal(hs).astype(f32)
+        k = (rng.standard_normal((nblk * 16, hs)) * 0.7).astype(f32)  # rows past nt: padding
+        y = np.empty(nblk * 16, f32)
+        for t in range(nblk * 16):
+            s = f32(0.0)
+            for i in range(hs):
+                s = f32(s + f32(q[i] * k[t, i]))
+            y[t] = s
+        # [blk][i][t % 16]
+        stream = k.reshape(nblk, 16, hs).transpose(0, 2, 1).reshape(-1)
+        a = q
+    else:
+        a = rng.random(nt).astype(f32)
+        a = (a / a.sum(dtype=f32)).astype(f32)
+        v = rng.standard_normal((nt, hs)).astype(f32)
+        y = np.empty(hs, f32)
+        for i in range(hs):
+            s = f32(0.0)
+            for t in range(nt):
+                s = f32(s + f32(a[t] * v[t, i]))
+            y[i] = s
+        stream = v.reshape(-1)
+    (d / "a.hex").write_text("\n".join(hexw(a)) + "\n")
+    lines = beat_lines(stream)
+    (d / "beats.hex").write_text("\n".join(lines) + "\n")
+    (d / "y.hex").write_text("\n".join(hexw(y)) + "\n")
+    return f"{name} {mode} {hs} {nt} {len(lines)} {len(y)}"
+
+
+def main() -> int:
+    out = Path(sys.argv[1])
+    rng = np.random.default_rng(7)
+    for c in CASES:
+        print(gen(out, *c, rng))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
