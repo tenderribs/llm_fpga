@@ -23,6 +23,12 @@ firmware's, is bit-identical to llama2.c's `runq.c`.
 
 ## Architecture
 
+![System overview: host PC, the FPGA's CPU subsystem and llm_core, the DDR3 controller, DDR3 and the microSD card](docs/diagrams/system.drawio.svg)
+
+The diagrams in `docs/diagrams/` are `.drawio.svg` files: GitHub shows them as
+images, and draw.io (or the VS Code draw.io extension) opens them for
+editing.
+
 ### Quantized matrix-vector engine (`qmv.sv`)
 
 Computes `y = W @ x` exactly as `runq.c`'s `matmul()` does: for each row, per
@@ -60,6 +66,8 @@ beats.
 
 ### `top_soc`: MicroBlaze V
 
+![llm_core's blocks: UART command logic, CPU registers, microSD controller, AXI master, weight reader, matmul engine, attention unit, result RAM and FIFOs](docs/diagrams/llm_core.drawio.svg)
+
 - CPU block design (`scripts/gen_cpu.tcl`): MicroBlaze V, RV32IMF with a
   single-precision FPU, at 150 MHz from its own clocking wizard (its
   pipeline doesn't close at 225 MHz). 256 KB of local block RAM holds the
@@ -70,6 +78,10 @@ beats.
   console output on the same UART.
 - Address map (CPU): local memory at 0, `llm_core` at `0x4000_0000`, DDR3 at
   `0x8000_0000` (cached up to `0x9FFF_FFFF`, uncached above).
+
+![One token's forward pass, coloured by what runs each step: CPU, matmul engine or attention unit](docs/diagrams/token_flow.drawio.svg)
+
+![The CPU's address map, and what DDR3 holds: the model image, the heap and the KV cache](docs/diagrams/memory.drawio.svg)
 
 The **model image** (`host/build_image.py`) is what the firmware reads, laid
 out as it sits in DDR3:
