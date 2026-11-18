@@ -68,9 +68,13 @@ switch $stage {
         # carries the constraints, so the XDC is not read again here.
         open_checkpoint $out_dir/post_synth.dcp
         opt_design
-        place_design
-        phys_opt_design
-        route_design
+        place_design -directive ExtraTimingOpt
+        phys_opt_design -directive AggressiveExplore
+        route_design -directive AggressiveExplore
+        # a last physical optimization if routing left some paths short
+        if {[get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]] < 0} {
+            phys_opt_design -directive AggressiveExplore
+        }
         report_utilization -file $out_dir/post_route_utilization.rpt
         report_timing_summary -file $out_dir/post_route_timing.rpt
         report_drc -file $out_dir/post_route_drc.rpt

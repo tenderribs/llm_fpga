@@ -14,15 +14,18 @@
 //            A RAM[i] = e_i / sum                     (attention weights)
 //
 // Each operation runs as passes that stream elements through shared units
-// (one divider, one exp, one adder, two multipliers): reads come back one
-// cycle after the address, results are written as they come out. The
+// (one divider, one exp, one adder, two multipliers): read data is used
+// RdLat cycles after the address goes out (the RAMs register the address,
+// read, and the data is registered here), results are written as they come
+// out. The
 // softmax sum is a chain of dependent adds, one element per add latency.
 // Exp results below 2^-126 are flushed to zero (see fp32_exp).
 module vpu #(
     parameter int YAddrW = 15,
     parameter int VAddrW = 12,
     parameter int XLineW = 6,  // qmv x RAM lines (MaxN / 32)
-    parameter int AAddrW = 12
+    parameter int AAddrW = 12,
+    parameter int RdLat = 3
 ) (
     input wire logic clk_i,
     input wire logic rst_ni,
@@ -84,8 +87,15 @@ module vpu #(
   logic [15:0] iss_q;  // next element to issue
   logic [15:0] res_q;  // results of this pass so far
   logic ph_q;  // SILU: 0 read a, 1 read b
-  logic rd_v_q, rd_ph_q;  // data arrives this cycle (for element rd_i_q)
+  // reads in flight: RdLat stages; the last is the registered data's cycle
+  logic [RdLat-1:0] rd_v_sr, rd_ph_sr;
+  logic [RdLat-1:0][15:0] rd_i_sr;
+  logic rd_v_q, rd_ph_q;  // the data in d_q is element rd_i_q's
   logic [15:0] rd_i_q;
+  logic [31:0] d_q;
+  assign rd_v_q = rd_v_sr[RdLat-1];
+  assign rd_ph_q = rd_ph_sr[RdLat-1];
+  assign rd_i_q = rd_i_sr[RdLat-1];
   logic sum_busy_q;  // SM3: an add in flight
 
   logic [15:0] limit;  // elements this pass
@@ -100,7 +110,7 @@ module vpu #(
   always_comb begin
     case (pass_q)
       P_QMAX, P_QDIV, P_SILU, P_SM1, P_SM2, P_SM4: issue = (iss_q < limit);
-      P_SM3: issue = (iss_q < limit) && !sum_busy_q && !rd_v_q;
+      P_SM3: issue = (iss_q < limit) && !sum_busy_q && (rd_v_sr == '0);
       default: issue = 1'b0;
     endcase
   end
@@ -121,7 +131,8 @@ module vpu #(
   assign rd_from_v = (pass_q == P_SM2) || ((pass_q == P_QMAX || pass_q == P_QDIV) && src_v_q);
 
   logic [31:0] rd_data;
-  assign rd_data = rd_from_v ? v_rdata_i : y_rdata_i;
+  assign rd_data = d_q;
+  always_ff @(posedge clk_i) d_q <= rd_from_v ? v_rdata_i : y_rdata_i;
 
   // ---------------------------------------------------------------------------
   // Units. Tag: element index, a, b (SILU's operands)
@@ -299,8 +310,34 @@ module vpu #(
   // ---------------------------------------------------------------------------
   // Pass sequencing
   // ---------------------------------------------------------------------------
-  logic last_line;  // QDIV: the line's last byte comes out of the divider now
-  assign last_line = (pass_q == P_QDIV) && div_v && (res_q == 16'd31);
+  // QDIV: the divider's output registered, then rounded into the line
+  logic dq_v;
+  logic [4:0] dq_i;
+  logic [31:0] dq_y;
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) dq_v <= 1'b0;
+    else dq_v <= (pass_q == P_QDIV) && div_v;
+  end
+  always_ff @(posedge clk_i) begin
+    dq_i <= div_t.i[4:0];
+    dq_y <= div_y;
+  end
+  logic last_line;  // the line's last byte is in dq now
+  assign last_line = (pass_q == P_QDIV) && dq_v && (res_q == 16'd31);
+
+  // SM1: the result and its ordered key registered, then the max update
+  logic mk_v;
+  logic [15:0] mk_i;
+  logic [31:0] mk_y, mk_key, max_key_q;
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) mk_v <= 1'b0;
+    else mk_v <= (pass_q == P_SM1) && div_v;
+  end
+  always_ff @(posedge clk_i) begin
+    mk_i <= div_t.i;
+    mk_y <= div_y;
+    mk_key <= fkey(div_y);
+  end
 
   always_ff @(posedge clk_i, negedge rst_ni) begin
     if (~rst_ni) begin
@@ -309,9 +346,9 @@ module vpu #(
       iss_q <= '0;
       res_q <= '0;
       ph_q <= 1'b0;
-      rd_v_q <= 1'b0;
-      rd_ph_q <= 1'b0;
-      rd_i_q <= '0;
+      rd_v_sr <= '0;
+      rd_ph_sr <= '0;
+      rd_i_sr <= '0;
       grp_q <= '0;
       sum_busy_q <= 1'b0;
       qscale_go <= 1'b0;
@@ -324,9 +361,9 @@ module vpu #(
       xs_we_o <= 1'b0;
 
       // issue
-      rd_v_q <= issue;
-      rd_ph_q <= ph_q;
-      rd_i_q <= iss_q;
+      rd_v_sr <= {rd_v_sr[RdLat-2:0], issue};
+      rd_ph_sr <= {rd_ph_sr[RdLat-2:0], ph_q};
+      rd_i_sr <= {rd_i_sr[RdLat-2:0], iss_q};
       if (issue) begin
         if (pass_q == P_SILU) begin
           ph_q <= !ph_q;
@@ -381,14 +418,14 @@ module vpu #(
         end
 
         P_QDIV: begin
-          if (div_v) begin
-            line_q[div_t.i[4:0]] <= rmm8(div_y);
+          if (dq_v) begin
+            line_q[dq_i] <= rmm8(dq_y);
             res_q <= res_q + 1;
           end
           if (last_line) begin
             xq_we_o <= 1'b1;
             xq_addr_o <= XLineW'(grp_q);
-            xq_data_o <= {rmm8(div_y), line_q[30:0]};
+            xq_data_o <= {rmm8(dq_y), line_q[30:0]};
             xs_we_o <= 1'b1;
             xs_addr_o <= XLineW'(grp_q);
             xs_data_o <= scale_q;
@@ -417,8 +454,11 @@ module vpu #(
         end
 
         P_SM1: begin
-          if (div_v) begin
-            if (div_t.i == 0 || fkey(div_y) > fkey(max_q)) max_q <= div_y;
+          if (mk_v) begin
+            if (mk_i == 0 || mk_key > max_key_q) begin
+              max_q <= mk_y;
+              max_key_q <= mk_key;
+            end
             res_q <= res_q + 1;
             if (res_q == n_q - 1) begin
               iss_q <= '0;

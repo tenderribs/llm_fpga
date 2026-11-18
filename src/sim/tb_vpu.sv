@@ -2,8 +2,8 @@
 `default_nettype none
 
 // vpu.sv against sim/gen_vpu.py vectors (sim/run_vpu.sh): behavioral Y / V
-// RAMs (read data one cycle after the address), qmv x RAM and attn A RAM
-// write capture; every result checked bit for bit.
+// RAMs (registered address, then the read, as in llm_core), qmv x RAM and
+// attn A RAM write capture; every result checked bit for bit.
 module tb_vpu #(
     parameter string VecDir = "",
     parameter int Op = 1,  // 1 QUANT, 2 SILU, 3 SOFTMAX
@@ -46,11 +46,22 @@ module tb_vpu #(
   logic [255:0] xq[64];
   logic [31:0] xs[64];
   logic [31:0] aram[4096];
+  // like llm_core: address, write enable and data registered, then the RAM
+  logic y_we_q, v_we_q;
+  logic [14:0] y_addr_q;
+  logic [11:0] v_addr_q;
+  logic [31:0] y_wdata_q, v_wdata_q;
   always_ff @(posedge clk) begin
-    if (y_we) yram[y_addr] <= y_wdata;
-    y_rdata <= yram[y_addr];
-    if (v_we) vram[v_addr] <= v_wdata;
-    v_rdata <= vram[v_addr];
+    y_we_q <= y_we;
+    y_addr_q <= y_addr;
+    y_wdata_q <= y_wdata;
+    v_we_q <= v_we;
+    v_addr_q <= v_addr;
+    v_wdata_q <= v_wdata;
+    if (y_we_q) yram[y_addr_q] <= y_wdata_q;
+    y_rdata <= yram[y_addr_q];
+    if (v_we_q) vram[v_addr_q] <= v_wdata_q;
+    v_rdata <= vram[v_addr_q];
     if (xq_we) xq[xq_addr] <= xq_data;
     if (xs_we) xs[xs_addr] <= xs_data;
     if (a_we) aram[a_addr] <= a_data;

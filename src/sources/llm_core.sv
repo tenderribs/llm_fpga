@@ -1041,14 +1041,28 @@ module llm_core #(
       ya_wdata = y;
     end
   end
+  // address, write enable and data registered (the Y RAM is 32 block RAMs:
+  // too much fanout after the muxes); read data a cycle later
+  logic ya_we_q;
+  logic [$clog2(YWords)-1:0] ya_addr_q;
+  logic [31:0] ya_wdata_q;
   always_ff @(posedge clk_i) begin
-    if (ya_we) yram[ya_addr] <= ya_wdata;
-    yram_rdata <= yram[ya_addr];
+    ya_we_q <= ya_we;
+    ya_addr_q <= ya_addr;
+    ya_wdata_q <= ya_wdata;
+    if (ya_we_q) yram[ya_addr_q] <= ya_wdata_q;
+    yram_rdata <= yram[ya_addr_q];
   end
-  // V RAM port A: the vector unit
+  // V RAM port A: the vector unit, registered the same way
+  logic va_we_q;
+  logic [11:0] va_addr_q;
+  logic [31:0] va_wdata_q;
   always_ff @(posedge clk_i) begin
-    if (vpu_v_we) vram[vpu_v_addr] <= vpu_v_wdata;
-    vpu_v_rdata <= vram[vpu_v_addr];
+    va_we_q <= vpu_v_we;
+    va_addr_q <= vpu_v_addr;
+    va_wdata_q <= vpu_v_wdata;
+    if (va_we_q) vram[va_addr_q] <= va_wdata_q;
+    vpu_v_rdata <= vram[va_addr_q];
   end
   // port B (the CPU's local memory bus): Y reads, V reads and writes
   logic [31:0] yb_y_q, yb_v_q;
@@ -1153,22 +1167,25 @@ module llm_core #(
   end
 
   // ---- reads: one at a time, data the cycle after the address (Y RAM read)
-  logic rd_pend_q;
+  // data two cycles after the address (the Y RAM's address is registered)
+  logic rd_pend_q, rd_pend2_q;
   logic [17:0] raddr_q;
-  assign s_arready_o = !rd_pend_q && !s_rvalid_o;
-  assign cin_pop = rd_pend_q && (raddr_q == 18'h0000C) && !cin_empty;
+  assign s_arready_o = !rd_pend_q && !rd_pend2_q && !s_rvalid_o;
+  assign cin_pop = rd_pend2_q && (raddr_q == 18'h0000C) && !cin_empty;
 
   always_ff @(posedge clk_i, negedge rst_ni) begin
     if (~rst_ni) begin
       rd_pend_q <= 1'b0;
+      rd_pend2_q <= 1'b0;
       s_rvalid_o <= 1'b0;
     end else begin
+      rd_pend2_q <= rd_pend_q;
       if (s_arvalid_i && s_arready_o) begin
         rd_pend_q <= 1'b1;
         raddr_q <= s_araddr_i;
       end
-      if (rd_pend_q) begin
-        rd_pend_q <= 1'b0;
+      if (rd_pend_q) rd_pend_q <= 1'b0;
+      if (rd_pend2_q) begin
         s_rvalid_o <= 1'b1;
         if (raddr_q[17]) s_rdata_o <= yram_rdata;
         else begin
