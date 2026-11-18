@@ -449,6 +449,18 @@ module tb_llm_core #(
         end
       end
 
+      // wipe x in the engine (a UART matmul with x = 0), so the CPU matmul
+      // can only pass if the XQ / XS writes really land
+      begin
+        logic [7:0] zr[$];
+        send_byte(8'h03);
+        send_u32(32'h0002_0000);
+        send_u32({16'(D0), 16'(N0)});
+        for (int i = 0; i < N0; i++) send_byte(8'h00);
+        for (int i = 0; i < N0 / GS; i++) send_u32(32'h0);
+        recv(4 * D0, zr);
+      end
+
       // x for the first matmul, through the CPU windows
       for (int i = 0; i < N0 / P; i++)
         for (int w = 0; w < 8; w++) axil_write(18'h01000 + 18'((i * 8 + w) * 4), xq[i][w*32+:32]);
@@ -481,8 +493,8 @@ module tb_llm_core #(
       $display("MISMATCH %0d SD protocol errors", u_card.errors);
       errors++;
     end
-    if (led[7:4] !== 4'd4) begin
-      $display("MISMATCH job LEDs %0d, exp 4", led[7:4]);
+    if (led[7:4] !== 4'd5) begin
+      $display("MISMATCH job LEDs %0d, exp 5", led[7:4]);
       errors++;
     end
 

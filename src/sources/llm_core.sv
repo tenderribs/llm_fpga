@@ -836,7 +836,7 @@ module llm_core #(
         if (s_awaddr_i == 18'h00010) cpu_addr_q <= s_wdata_i;
         if (s_awaddr_i == 18'h00014) cpu_nd_q <= s_wdata_i;
         if (s_awaddr_i == 18'h00018) cpu_start_q <= 1'b1;
-        if (s_awaddr_i[17:11] == 7'b0000_001) begin  // 0x01000..0x017FF: XQ
+        if (s_awaddr_i[17:11] == 7'b0000_010) begin  // 0x01000..0x017FF: XQ
           if (s_awaddr_i[4:2] == 3'd7) begin
             cpu_xq_we_q <= 1'b1;
             cpu_xq_addr_q <= ($clog2(MaxN/P))'(s_awaddr_i[10:5]);
@@ -845,7 +845,7 @@ module llm_core #(
             xq_stage_q[s_awaddr_i[4:2]] <= s_wdata_i;
           end
         end
-        if (s_awaddr_i[17:8] == 10'b0000_0001_10) begin  // 0x01800..0x018FF: XS
+        if (s_awaddr_i[17:8] == 10'b00_0001_1000) begin  // 0x01800..0x018FF: XS
           cpu_xs_we_q <= 1'b1;
           cpu_xs_addr_q <= ($clog2(MaxN/GS))'(s_awaddr_i[7:2]);
           cpu_xs_data_q <= s_wdata_i;

@@ -10,13 +10,17 @@ if {$elf eq ""} { error "usage: xsdb scripts/run_fw.tcl <program.elf>" }
 connect
 # The JTAG chip shows up as two targets (see make program); the debug module
 # is on the one with the FPGA. Look for the CPU in all of them.
+# The list fills in over the first second or so after connect.
 set cpu ""
-foreach line [split [targets] "\n"] {
-    if {[regexp {^\s*\*?\s*(\d+)\s+(.*)$} $line -> id name]} {
-        if {[string match -nocase "*MicroBlaze*" $name] || [string match -nocase "*Hart*" $name]} {
-            set cpu $id
-            puts "CPU target $id: [string trim $name]"
-            break
+for {set try 0} {$try < 20 && $cpu eq ""} {incr try} {
+    after 250
+    foreach line [split [targets] "\n"] {
+        if {[regexp {^\s*\*?\s*(\d+)\s+(.*)$} $line -> id name]} {
+            if {[string match -nocase "*MicroBlaze*" $name] || [string match -nocase "*Hart*" $name]} {
+                set cpu $id
+                puts "CPU target $id: [string trim $name]"
+                break
+            }
         }
     }
 }
