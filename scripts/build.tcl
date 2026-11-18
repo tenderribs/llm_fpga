@@ -15,6 +15,26 @@ set stage [lindex $argv 0]
 set top   [lindex $argv 1]
 set out_dir $repo_root/build/$top
 
+# Open the board's FPGA in the hardware manager and return it. The board's JTAG
+# chip shows up as two targets, and only one has the FPGA on its chain; their
+# order varies, so try each.
+proc open_fpga {} {
+    open_hw_manager
+    connect_hw_server
+    set dev ""
+    foreach t [get_hw_targets] {
+        catch {close_hw_target}
+        if {[catch {open_hw_target -quiet $t}]} continue
+        set dev [lindex [get_hw_devices -quiet xc7k325t*] 0]
+        if {$dev ne ""} break
+    }
+    if {$dev eq ""} {
+        error "No xc7k325t found on any JTAG target: [get_hw_targets]"
+    }
+    current_hw_device $dev
+    return $dev
+}
+
 # Each stage writes its checkpoint last. Make treats that file as proof the stage
 # finished, so a stage that fails partway through runs again next time.
 switch $stage {
@@ -75,28 +95,48 @@ switch $stage {
         }
     }
     program {
-        # Load the bitstream over the board's JTAG USB port. The design is lost
-        # at power-off; this does not write the flash.
-        open_hw_manager
-        connect_hw_server
-        # The board's JTAG chip shows up as two targets, and only one has the
-        # FPGA on its chain; their order varies, so try each.
-        set dev ""
-        foreach t [get_hw_targets] {
-            catch {close_hw_target}
-            if {[catch {open_hw_target -quiet $t}]} continue
-            set dev [lindex [get_hw_devices -quiet xc7k325t*] 0]
-            if {$dev ne ""} break
-        }
-        if {$dev eq ""} {
-            error "No xc7k325t found on any JTAG target: [get_hw_targets]"
-        }
-        current_hw_device $dev
-        set_property PROGRAM.FILE $out_dir/$top.bit $dev
+        # Load a bitstream over the board's JTAG USB port (argv 2, default
+        # build/<top>/<top>.bit). The design is lost at power-off; this does
+        # not write the flash.
+        set bit [lindex $argv 2]
+        if {$bit eq ""} { set bit $out_dir/$top.bit }
+        set dev [open_fpga]
+        set_property PROGRAM.FILE $bit $dev
         program_hw_devices $dev
         close_hw_manager
     }
+    flash {
+        # Write a bitstream (argv 2) to the board's quad-SPI flash, then have
+        # the FPGA configure itself from it. The board boots from the flash
+        # at power-on when its mode jumper is set to QSPI. This overwrites
+        # whatever the flash held.
+        set bit [lindex $argv 2]
+        set mcs [file rootname $bit].mcs
+        write_cfgmem -force -format mcs -size 32 -interface SPIx4 \
+            -loadbit "up 0x00000000 $bit" -file $mcs
+        set dev [open_fpga]
+        # Genesys 2: Spansion S25FL256S (FLASH_PART overrides)
+        set part_name s25fl256sxxxxxx0-spi-x1_x2_x4
+        if {[info exists ::env(FLASH_PART)]} { set part_name $::env(FLASH_PART) }
+        create_hw_cfgmem -hw_device $dev [lindex [get_cfgmem_parts $part_name] 0]
+        set cm [get_property PROGRAM.HW_CFGMEM $dev]
+        set_property PROGRAM.ADDRESS_RANGE {use_file} $cm
+        set_property PROGRAM.FILES [list $mcs] $cm
+        set_property PROGRAM.UNUSED_PIN_TERMINATION {pull-none} $cm
+        set_property PROGRAM.BLANK_CHECK 0 $cm
+        set_property PROGRAM.ERASE 1 $cm
+        set_property PROGRAM.CFG_PROGRAM 1 $cm
+        set_property PROGRAM.VERIFY 1 $cm
+        set_property PROGRAM.CHECKSUM 0 $cm
+        # the FPGA gets a helper design that drives the flash for Vivado
+        create_hw_bitstream -hw_device $dev [get_property PROGRAM.HW_CFGMEM_BITFILE $dev]
+        program_hw_devices $dev
+        refresh_hw_device $dev
+        program_hw_cfgmem -hw_cfgmem $cm
+        boot_hw_device $dev
+        close_hw_manager
+    }
     default {
-        error "Unknown stage '$stage': use synth, impl, bit or program"
+        error "Unknown stage '$stage': use synth, impl, bit, program or flash"
     }
 }
