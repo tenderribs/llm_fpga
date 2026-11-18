@@ -6,11 +6,13 @@ models, starting with stories15M) on a Digilent Genesys 2 board (Kintex-7
 
 Current state: stories15M runs entirely on the board. A MicroBlaze V soft
 CPU on the FPGA runs `runq.c`'s forward pass (`fw/`). In the fabric, an int8
-matrix-vector engine does every matmul, streaming the weights from DDR3, and
-an fp32 attention unit computes the attention scores and weighted sums. The
-design and firmware boot from the board's flash, the model loads from a
-microSD card in the board's slot, and prompts come from the PC over the
-USB-UART (`host/chat.py`). Greedy generation runs at about 30 tokens/s, and
+matrix-vector engine does every matmul, streaming the weights from DDR3, an
+fp32 attention unit computes the attention scores and weighted sums, and an
+fp32 vector unit does quantize, SwiGLU and softmax. The design and firmware
+boot from the board's flash, the model loads from a microSD card in the
+board's slot, and prompts come from the PC over the USB-UART
+(`host/chat.py`). Greedy generation runs at about 165 tokens/s, faster than
+llama2.c's bit-exact build on one core of a desktop CPU, and
 every step's logits are bit-identical to an x86 build of the same firmware.
 That x86 build, with the C library's math functions instead of the
 firmware's, is bit-identical to llama2.c's `runq.c`.
@@ -56,10 +58,30 @@ For one head, the two float loops of `runq.c`'s attention: the scores
 `q · k_t` for every timestep, then the weighted sum `Σ a_t v_t` once the CPU
 has done the softmax. Each sum adds its terms in `runq.c`'s order on the
 engine's fp32 units, so the results are bit-exact. K and V stream from DDR3
-through the weight reader, one multiply-add per cycle. K is stored in blocks
-of 16 timesteps, transposed, so 16 independent sums are in flight and hide
-the adder's latency. The CPU writes the KV cache through the uncached DDR3
-window, so the unit reads exactly what was written.
+through the weight reader, a 32-byte beat per cycle into 8 multiply-add
+lanes. K is stored in blocks of 128 timesteps, transposed, so each lane has
+16 independent sums in flight to hide the adder's latency. Each layer's k
+and v are written into the KV cache by a DMA job from the vector unit's RAM
+(K's words 512 bytes apart, with byte strobes).
+
+### Vector unit (`vpu.sv`)
+
+The float work between the matmuls, with the firmware's operations in the
+firmware's order, so the results are the same bits:
+
+- QUANT: a vector into the matmul engine's x RAM as Q8_0 groups (max, scale
+  = max / 127, round half away from zero)
+- SILU: SwiGLU on the w1 and w3 results, `(a · 1 / (1 + e^-a)) · b`
+- SOFTMAX: scale the scores, max, `exp`, a sequential sum, divide, straight
+  into the attention unit's A RAM
+- COPY: q into the attention unit
+
+It streams elements through a pipelined divider (`fp32_div.sv`, correctly
+rounded) and an exp pipeline (`fp32_exp.sv`, the firmware's `m_expf` step by
+step on the fp32 units), reading the matmul results in the Y RAM and its own
+8K-word V RAM, which the CPU also reaches over its local memory bus. The
+CPU's part of a layer is now RMSNorm, RoPE, the residual adds and starting
+the jobs.
 
 ### `top_llm`: DDR3, commands, microSD
 
@@ -184,15 +206,20 @@ TB=tb_top_gemm sim/run_verilator.sh 2 4 16   # top_gemm through the UART pins
 
 `run_qmv.sh` runs:
 
-1. `tb_fp32`: the float units against numpy float32, on 60k vectors
-   including exact rounding ties (`sim/gen_qmv.py fp`)
+1. `tb_fp32`: the float units against numpy float32, on 100k vectors
+   including exact rounding ties, and the exp pipeline against the
+   firmware's `m_expf` (`sim/gen_qmv.py fp`)
 2. `tb_qmv`: the engine on real `runq.c` matmuls (layer 0 wq, w1, w2 and the
    32000-row classifier) plus a random group-size-64 one, every output
    checked bit-exact, with random stalls in the weight stream
 3. `tb_top_qmv`: `top_qmv` through its UART pins, including the idle timeout
-4. `tb_llm_core`: `top_llm`'s logic (everything but the DDR controller)
-   against an AXI memory model and an SD card model: every command, real
-   matmuls from "DDR", an SD store / load round trip
+4. `tb_llm_core`: `llm_core` (everything but the DDR controller and the
+   CPU) against an AXI memory model and an SD card model: every command,
+   real matmuls from "DDR", an SD store / load round trip, and the CPU side:
+   matmuls, attention, vector unit and DMA jobs through the registers
+
+`sim/run_attn.sh` and `sim/run_vpu.sh` test the attention unit and the
+vector unit on their own, every result bit-exact.
 
 `src/sim/` also has the models: `axi_mem_model.sv` (AXI4 memory with random
 stalls) and `sd_card_model.sv` (SPI-mode SDHC / SDSC card with random
@@ -267,6 +294,11 @@ fw/build/golden models/stories15M.img "Once upon a time" 256 /tmp > golden.txt
 grep '^T ' run.txt | diff - golden.txt   # identical
 ```
 
+Other firmware (`make -C fw`) is loaded over JTAG onto a running `top_soc`
+(`make TOP=top_soc program`): `xsdb scripts/run_fw.tcl fw/build/bringup.elf`
+tests the CPU, FPU, DDR3 and the engine; `fw/build/membench.elf` measures
+memory latency (output: `python3 host/console.py`).
+
 **Standalone:** `make TOP=top_soc flash` writes that bitstream to the
 board's QSPI flash (erasing what was there). With the mode jumper on QSPI,
 the board then boots by itself at power-on: it configures from the flash,
@@ -284,18 +316,19 @@ story ends. Board: `host/chat.py`, timed by the firmware. Host: llama2.c's
 
 | Platform | Build | tokens/s |
 |---|---|---|
-| FPGA board: MicroBlaze V at 150 MHz, engine and attention unit at 225 MHz | this repo | **32** |
+| FPGA board: MicroBlaze V at 150 MHz, engine, attention and vector units at 225 MHz | this repo | **165** |
 | Ryzen 7 3700X, 1 thread | `runq.c`, `gcc -O2` (bit-exact build) | 108 |
 | Ryzen 7 3700X, 1 thread | `runq.c`, `gcc -Ofast -march=native` | 250 |
 | Ryzen 7 3700X, 8 threads | `runq.c`, `-Ofast -march=native -fopenmp` | 1465 |
 
-The desktop is 3.4x faster on one core and about 45x faster on all eight;
-it also runs at a ~30x higher clock. The board's time per token is ~17 ms of
-float work on the 150 MHz CPU (quantize, SwiGLU, RoPE), ~5 ms of matmuls and
-4-13 ms of attention; the engine streams the 17 MB of weights per token in
-about 3 ms. Without the engine and attention unit, the MicroBlaze V alone
-would manage about 1 token/s (from bring-up's 288x288 matmul on the CPU).
-Power wasn't measured.
+The board is 1.5x faster than the desktop's bit-exact build on one core,
+at a ~30x lower clock; the desktop's fastest single-thread build is 1.5x
+faster than the board, and all eight cores about 9x. The board's 6.1 ms per
+token: matmuls 3.1 ms (the engine streams 17 MB of weights per token from
+DDR3, about 2.7 ms at the memory's bandwidth), attention 1.2 ms (with the
+KV cache writes), and ~1.8 ms on the CPU (RMSNorm 0.6, RoPE 0.4, starting
+jobs and moving vectors). Without the accelerators, the MicroBlaze V alone
+would manage about 1 token/s. Power wasn't measured.
 
 How the board's speed developed (same model and prompt, a fixed 256 tokens,
 so a little slower than the 168-token story above; the first row: 64):
@@ -308,26 +341,22 @@ so a little slower than the 168-token story above; the first row: 64):
 | 5-stage CPU pipeline, 32 KB write-back data cache | 11.3 |
 | fp32 attention unit | 19.7 |
 | Results over the local memory bus, argmax in hardware | 27.5 |
+| Firmware: independent float work overlapped (same bits) | 36.4 |
+| fp32 vector unit: quantize, SwiGLU, softmax | 94.1 |
+| 8-lane attention unit; KV cache by DMA; q by the vector unit | 116.3 |
+| DMA writes in flight; RoPE / residuals unrolled | 128.3 |
+| Weight reader: 512-beat FIFO, 8 reads in flight | 132.1 |
 
 ## Status and next steps
 
-Measured on the board (stories15M, greedy, `host/chat.py`): 31-38 tokens/s
-for a full story; the time per token is about 17 ms of float work on the
-CPU (quantize 6.7, SwiGLU 6.7, RoPE 3), 5 ms of matmuls and 4-13 ms of
-attention (growing with the story's length).
+Measured on the board (stories15M, greedy, `host/chat.py`): about 165
+tokens/s for a full story (the time per token above).
 
 - [ ] Power-on boot from the QSPI flash (needs a power cycle on site; the
       mode jumper must be on QSPI)
-- [ ] RoPE: its sin / cos depend only on the position, so compute them once
-      per token instead of in every layer (same bits)
-- [ ] Quantize and SwiGLU (divisions and `expf`) in hardware, or several
-      elements at a time on the CPU
+- [ ] RMSNorm and RoPE on the vector unit, so a layer runs without the CPU
+      touching the data
 - [ ] Bigger models: stories42M, stories110M (the microSD card has room)
-
-Other firmware (`make -C fw`) is loaded over JTAG onto a running `top_soc`
-(`make TOP=top_soc program`): `xsdb scripts/run_fw.tcl fw/build/bringup.elf`
-tests the CPU, FPU, DDR3 and the engine; `fw/build/membench.elf` measures
-memory latency (output: `python3 host/console.py`).
 
 `top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
 `host/gemm_uart.py`.
