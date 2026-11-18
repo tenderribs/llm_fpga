@@ -252,13 +252,16 @@ def system():
     d.box("regs", 650, 185, 150, 55, ["CPU registers", "AXI4-Lite"], color="green")
     d.box("sdc", 650, 255, 150, 55, ["microSD controller", "SPI mode, boot load"],
           color="green")
-    d.box("axim", 650, 330, 150, 55, ["AXI4 master", "256-bit, to DDR3"], color="green")
+    d.box("axim", 650, 330, 150, 55, ["AXI4 master", "256-bit: weights, KV DMA"],
+          color="green")
+    d.box("vpu", 830, 330, 240, 55, ["fp32 vector unit (vpu)", "quantize, SwiGLU, softmax"],
+          color="yellow")
     d.box("qmv", 830, 115, 240, 55, ["int8 matmul engine (qmv)",
                                      "Q8_0, 32 MACs / cycle, + argmax"], color="green")
     d.box("attn", 830, 185, 240, 55, ["fp32 attention unit (attn)",
-                                      "scores and weighted sum"], color="orange")
+                                      "8 lanes: scores, weighted sum"], color="orange")
     d.box("rdr", 830, 255, 115, 55, ["DDR reader", "weights, K, V"], color="green")
-    d.box("yram", 955, 255, 115, 55, ["Y RAM", "results, 2 ports"], color="green")
+    d.box("yram", 955, 255, 115, 55, ["Y / V RAMs", "results, vectors"], color="green")
 
     d.box("mig", 230, 450, 860, 55, ["DDR3 controller (MIG)",
                                      "1800 MT/s, 256-bit AXI, 225 MHz user clock"],
@@ -294,7 +297,7 @@ def system():
     # the CPU reads results straight from the Y RAM over its local memory bus
     d.edge("yram", "lmb", exit=(1, 0.5), entry=(0.5, 0), points=[(1100, 282.5), (1100, 45),
                                                                  (510, 45)],
-           label="LMB: results at local-memory speed", label_at=(930, 45))
+           label="LMB: results and vectors at local-memory speed", label_at=(930, 45))
     d.edge("flash", "fpga", exit=(1, 0.5), entry=(90 / 900, 1), points=[(300, 642.5)],
            label=["configuration", "at power-on"], label_at=(250, 600), label_w=80)
     d.write()
@@ -304,8 +307,8 @@ def system():
 # 2. llm_core internals
 # =============================================================================
 def core():
-    d = Diagram("llm_core", 1240, 700)
-    d.group("core", 20, 20, 1210, 670, "llm_core (225 MHz)", color="none",
+    d = Diagram("llm_core", 1240, 720)
+    d.group("core", 20, 20, 1210, 690, "llm_core (225 MHz)", color="none",
             subtitle="src/sources/llm_core.sv")
 
     d.box("rx", 40, 140, 130, 50, ["UART RX", "3 Mbaud"], color="gray")
@@ -313,31 +316,34 @@ def core():
                                      "SD_LOAD, SD_STORE"], color="green")
     d.box("sdc", 220, 250, 200, 60, ["sd_ctrl", "microSD (SPI), boot load"], color="green")
     d.box("ddr", 480, 50, 170, 45, ["SmartConnect", "-> DDR3"], color="blue")
-    d.box("mux", 480, 140, 170, 170, ["AXI4 master", "SD controller or", "command logic",
-                                      "(AR register slice)"], color="yellow")
-    d.box("rdr", 720, 175, 170, 100, ["wstream_reader", "2 KB bursts, 128-beat FIFO",
+    d.box("mux", 480, 140, 170, 170, ["AXI4 master", "SD controller, command", "logic or DMA",
+                                      "(V RAM -> DDR, KV cache)"], color="yellow")
+    d.box("rdr", 720, 175, 170, 100, ["wstream_reader", "2 KB bursts, 512-beat FIFO",
                                       "qmv format: splits off", "the scale beats;",
                                       "raw mode for K / V"], color="green")
     d.box("qmv", 960, 110, 220, 100, ["qmv: int8 matmul", "x RAM (x.q, x.s)",
                                       "32 int8 MACs / cycle", "16 rows in flight"],
           color="green")
     d.box("attn", 960, 260, 220, 100, ["attn: fp32 attention", "A RAM (q or a)",
-                                       "1 multiply-add / cycle", "16 or hs sums in flight"],
+                                       "8 lanes: 8 multiply-adds / cycle", "same sums, same order"],
           color="orange")
-    d.box("regs", 220, 430, 200, 90, ["CPU registers", "AXI4-Lite: MM_*, AT_*, ARGMAX,",
-                                      "CONSOLE (out / in), XQ / XS /", "AT_A windows, Y window"],
+    d.box("cin", 220, 330, 200, 60, ["Console input FIFO", "prompt bytes for the CPU"],
+          color="gray")
+    d.box("regs", 220, 430, 200, 90, ["CPU registers (AXI4-Lite)", "start the jobs: MM_*, AT_*,",
+                                      "VPU_*, DMA_*; ARGMAX,", "CONSOLE out / in"],
           color="green")
     d.box("yram", 960, 440, 220, 50, ["Y RAM, 32K words", "results of CPU jobs; argmax"],
           color="green")
-    d.box("lmbp", 690, 520, 200, 45, ["CPU local memory bus", "(LMB, 150 MHz clock)"],
+    d.box("vpu", 690, 520, 200, 70, ["vpu: fp32 vector unit", "QUANT, SILU, SOFTMAX, COPY",
+                                     "divide, exp, add, multiply"], color="yellow")
+    d.box("vram", 690, 615, 200, 40, ["V RAM, 8K words", "vectors, scratch"], color="green")
+    d.box("lmbp", 960, 615, 220, 40, ["CPU local memory bus", "(LMB): Y and V RAMs"],
           color="purple")
-    d.box("cin", 220, 330, 200, 60, ["Console input FIFO", "prompt bytes for the CPU"],
+    d.box("yfifo", 960, 540, 220, 50, ["Result FIFO", "results of UART matmuls"],
           color="gray")
-    d.box("yfifo", 960, 560, 220, 50, ["Result FIFO", "results of UART matmuls"],
+    d.box("cons", 220, 590, 200, 50, ["Console FIFO", "CPU text, between commands"],
           color="gray")
-    d.box("cons", 220, 580, 200, 50, ["Console FIFO", "CPU text, between commands"],
-          color="gray")
-    d.box("tx", 40, 580, 130, 50, ["UART TX"], color="gray")
+    d.box("tx", 40, 590, 130, 50, ["UART TX"], color="gray")
 
     d.edge("rx", "fsm", entry=(0, 0.5))
     d.edge("fsm", "mux", exit=(1, 0.5), entry=(0, 25 / 170))
@@ -354,31 +360,36 @@ def core():
            label="K / V", label_at=(925, 285), label_w=36)
     d.edge("fsm", "qmv", exit=(0.5, 0), entry=(0.5, 0), points=[(320, 35), (1070, 35)],
            label="x, over the UART", label_at=(800, 35))
-    d.edge("regs", "attn", exit=(1, 0.15), entry=(0, 0.7), points=[(700, 443.5), (700, 330)],
-           label="q / a (AT_A)", label_at=(820, 330))
-    d.edge("regs", "qmv", exit=(0.85, 0), entry=(0, 0.8), points=[(390, 400), (940, 400),
-                                                                  (940, 190)],
-           label="x (XQ / XS)", label_at=(560, 400))
     d.edge("qmv", "yram", exit=(1, 0.8), entry=(1, 0.4), points=[(1200, 190), (1200, 460)])
-    d.edge("qmv", "yfifo", exit=(1, 0.6), entry=(1, 0.5), points=[(1215, 170), (1215, 585)])
-    d.text("yl", 1160, 520, 80, 16, "y", size=11)
+    d.edge("qmv", "yfifo", exit=(1, 0.6), entry=(1, 0.5), points=[(1215, 170), (1215, 565)])
+    d.text("yl", 1160, 505, 80, 16, "y", size=11)
     d.edge("attn", "yram", exit=(0.5, 1), entry=(0.5, 0), label="scores / sums",
            label_at=(1070, 400), label_w=82)
     d.edge("yram", "regs", exit=(0, 0.6), entry=(1, 40 / 90), label="Y window",
-           label_at=(600, 470), label_w=60)
+           label_at=(560, 470), label_w=60)
+    # the vector unit
+    d.edge("yram", "vpu", exit=(0.15, 1), entry=(1, 0.3), points=[(993, 541)], both=True,
+           label=["results,", "scratch"], label_at=(930, 520), label_w=56)
+    d.edge("vpu", "vram", exit=(0.5, 1), entry=(0.5, 0), both=True)
+    d.edge("vpu", "qmv", exit=(0.2, 0), entry=(0, 0.8), points=[(730, 400), (945, 400), (945, 190)],
+           label="x (QUANT)", label_at=(830, 400), label_w=66)
+    d.edge("vpu", "attn", exit=(0.85, 0), entry=(0.15, 1), points=[(860, 380), (993, 380)],
+           label=["a (SOFTMAX),", "q (COPY)"], label_at=(800, 360), label_w=84)
+    d.edge("vram", "lmbp", exit=(1, 0.5), entry=(0, 0.5), both=True)
+    d.edge("vram", "mux", exit=(0, 0.5), entry=(0.5, 1), points=[(565, 635)],
+           label="DMA", label_at=(565, 560), label_w=34)
+    # console
     d.edge("regs", "cons", exit=(0.5, 1), entry=(0.5, 0), label="CONSOLE",
-           label_at=(370, 550), label_w=60)
+           label_at=(370, 555), label_w=60)
     d.edge("cons", "tx", exit=(0, 0.5), entry=(1, 0.5))
-    d.edge("yfifo", "tx", exit=(0.5, 1), entry=(0.5, 1), points=[(1070, 660), (105, 660)],
-           label="matmul results", label_at=(600, 660))
-    d.edge("fsm", "tx", exit=(0, 0.8), entry=(1, 0.2), points=[(195, 189), (195, 590)],
-           label=["replies,", "READ data"], label_at=(195, 545), label_w=62)
+    d.edge("yfifo", "tx", exit=(0.5, 1), entry=(0.5, 1), points=[(1070, 690), (105, 690)],
+           label="matmul results", label_at=(600, 690))
+    d.edge("fsm", "tx", exit=(0, 0.8), entry=(1, 0.2), points=[(195, 189), (195, 600)],
+           label=["replies,", "READ data"], label_at=(195, 560), label_w=62)
     d.edge("rx", "cin", exit=(0.5, 1), entry=(0, 0.5), points=[(105, 360)],
            label=["CONSOLE_IN", "command"], label_at=(105, 280), label_w=72)
     d.edge("cin", "regs", exit=(0.25, 1), entry=(0.25, 0), label="CONSOLE_IN",
            label_at=(270, 410), label_w=72)
-    d.edge("yram", "lmbp", exit=(0.2, 1), entry=(1, 0.5), points=[(1004, 542.5)],
-           label="2nd port", label_at=(1004, 520), label_w=56)
     d.write()
 
 
@@ -393,31 +404,32 @@ def token():
     d.box("lc", 20, 50, 160, 30, "CPU (MicroBlaze V)", color="purple", title_bold=False)
     d.box("le", 190, 50, 160, 30, "int8 matmul engine", color="green", title_bold=False)
     d.box("la", 360, 50, 160, 30, "fp32 attention unit", color="orange", title_bold=False)
-    d.box("ld", 530, 50, 160, 30, "data in DDR3", color="blue", title_bold=False)
+    d.box("lv", 530, 50, 160, 30, "fp32 vector unit", color="yellow", title_bold=False)
+    d.box("ld", 700, 50, 160, 30, "data in DDR3", color="blue", title_bold=False)
 
     y1, y2, y3 = 130, 300, 470
     h = 70
     # row 1: attention block
     d.box("emb", 20, y1, 130, h, ["Embedding", "dequantize the", "token's row"],
           color="purple")
-    d.box("n1", 180, y1, 120, h, ["RMSNorm", "+ quantize x", "to int8"], color="purple")
+    d.box("n1", 180, y1, 120, h, ["RMSNorm (CPU)", "+ quantize", "(vector unit)"], color="purple")
     d.box("qkv", 330, y1, 120, h, ["q, k, v", "matmuls"], color="green")
     d.box("rope", 480, y1, 110, h, ["RoPE", "rotate q, k"], color="purple")
-    d.box("kv", 620, y1, 130, h, ["Store k, v", "uncached, in the", "unit's layouts"],
+    d.box("kv", 620, y1, 130, h, ["Store k, v", "DMA into the", "unit's layouts"],
           color="purple")
     d.box("sc", 780, y1, 130, h, ["Scores", "q . k_t, t <= pos"], color="orange")
-    d.box("sm", 940, y1, 110, h, ["Softmax", "scale, exp, sum"], color="purple")
+    d.box("sm", 940, y1, 110, h, ["Softmax", "scale, exp, sum"], color="yellow")
     d.box("ws", 1080, y1, 100, h, ["Weighted", "sum of v_t"], color="orange")
     # row 2: rest of the layer
-    d.box("wo", 1070, y2, 120, h, ["quantize +", "wo matmul"], color="green")
+    d.box("wo", 1070, y2, 120, h, ["quantize (VPU)", "+ wo matmul"], color="green")
     d.box("r1", 910, y2, 120, h, ["Residual", "x += ..."], color="purple")
-    d.box("n2", 760, y2, 120, h, ["RMSNorm", "+ quantize"], color="purple")
+    d.box("n2", 760, y2, 120, h, ["RMSNorm (CPU)", "+ quantize (VPU)"], color="purple")
     d.box("w13", 610, y2, 120, h, ["w1, w3", "matmuls"], color="green")
-    d.box("glu", 460, y2, 120, h, ["SwiGLU", "silu(h1) * h3"], color="purple")
-    d.box("w2", 310, y2, 120, h, ["quantize +", "w2 matmul"], color="green")
+    d.box("glu", 460, y2, 120, h, ["SwiGLU", "+ quantize"], color="yellow")
+    d.box("w2", 310, y2, 120, h, ["w2", "matmul"], color="green")
     d.box("r2", 160, y2, 120, h, ["Residual", "x += ..."], color="purple")
     # row 3: classifier
-    d.box("nf", 160, y3, 140, h, ["Final RMSNorm", "+ quantize"], color="purple")
+    d.box("nf", 160, y3, 140, h, ["Final RMSNorm", "+ quantize (VPU)"], color="purple")
     d.box("cls", 330, y3, 170, h, ["Classifier matmul", "32000 logits"], color="green")
     d.box("am", 530, y3, 140, h, ["Argmax", "in hardware, as the", "logits come out"],
           color="green")
@@ -443,8 +455,8 @@ def token():
         d.edge(a, b)
     d.text("note", 20, 565, 1160, 40,
            ["The prompt comes from host/chat.py over the UART; the CPU encodes it and feeds its "
-            "tokens through forward() before generating. The CPU reads every result over its local "
-            "memory bus.",
+            "tokens through forward() before generating. The CPU orchestrates: it starts the jobs and "
+            "does RMSNorm, RoPE and the residual adds.",
             "The float operations are runq.c's, in runq.c's order (no FMA): the board's logits are "
             "bit-identical to the x86 build of the same firmware."], size=11, bg=False)
     d.write()
@@ -461,10 +473,12 @@ def memory():
     rows = [
         ("0x0000_0000", "Local memory, 256 KB", "firmware, stack, hot buffers (LMB)", "purple", 60),
         ("0x0010_0000", "llm_core's result RAM (Y), 128 KB",
-         "on the local memory bus too: fast reads", "green", 50),
+         "on the local memory bus too: fast reads", "green", 40),
+        ("0x0012_0000", "llm_core's V RAM, 32 KB",
+         "the vector unit's; read / write", "green", 40),
         ("0x4000_0000", "llm_core registers, 256 KB", "uncached (AXI4-Lite)", "green", 60),
-        ("0x8000_0000", "DDR3, cached (512 MB)", "model image, heap", "blue", 130),
-        ("0xA000_0000", "DDR3, uncached (512 MB)", "KV cache (shared with the unit)", "blue", 130),
+        ("0x8000_0000", "DDR3, cached (512 MB)", "model image, heap", "blue", 110),
+        ("0xA000_0000", "DDR3, uncached (512 MB)", "KV cache (written by DMA)", "blue", 110),
     ]
     y = 50
     for i, (addr, name, sub, col, h) in enumerate(rows):
@@ -475,7 +489,7 @@ def memory():
     drows = [
         ("0x0000_0000", "Model image (host/build_image.py)", None, "blue", 250),
         ("0x1000_0000", "Heap (malloc): run state, logits, tokenizer", None, "gray", 60),
-        ("0x2000_0000", "KV cache: K per layer and head [block][i][t % 16],", "V per layer and head [t][i]", "orange", 70),
+        ("0x2000_0000", "KV cache: K per layer and head [block][i][t % 128],", "V per layer and head [t][i]", "orange", 70),
     ]
     y = 50
     for i, (addr, name, sub, col, h) in enumerate(drows):
@@ -500,12 +514,12 @@ def memory():
             "at power-on; host/image_tool.py uploads it over the UART.",
             "The QSPI flash holds the bitstream, with the firmware in the local memory."],
            size=11, bg=False)
-    m3, m4 = d.ids["m3"], d.ids["m4"]
+    m3, m4 = d.ids["m4"], d.ids["m5"]
     y3 = m3["y"] + m3["h"] * 0.3
     y4 = m4["y"] + m4["h"] * 0.3
-    d.edge("m3", "d0", exit=(1, 0.3), entry=(0, 0.2), points=[(560, y3), (560, 100)],
+    d.edge("m4", "d0", exit=(1, 0.3), entry=(0, 0.2), points=[(560, y3), (560, 100)],
            dashed=True)
-    d.edge("m4", "d2", exit=(1, 0.3), entry=(0, 0.5), points=[(580, y4), (580, 455)],
+    d.edge("m5", "d2", exit=(1, 0.3), entry=(0, 0.5), points=[(580, y4), (580, 455)],
            dashed=True)
     d.write()
 
