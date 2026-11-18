@@ -37,7 +37,7 @@ build/%.elf: %/*.c $(COMMON) common/link.ld common/llm_hw.h
 
 # programs using the model code
 build/llm.elf: $(MODEL) $(MODEL_H)
-build/llm.elf: CFLAGS += -Imodel
+build/llm.elf: CFLAGS += -Imodel -DMODEL_PROFILE
 
 golden: build/golden build/golden_libm
 build/golden build/golden_libm: golden/golden.c $(MODEL) $(MODEL_H)

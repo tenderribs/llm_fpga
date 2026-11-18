@@ -19,6 +19,17 @@ static void SINCOSF(float x, float *s, float *c) { *c = cosf(x); *s = sinf(x); }
 #define ROPE_FREQ(e) (1.0f / m_expf((e) * 9.21034049987793f))
 #endif
 
+#ifdef MODEL_PROFILE
+uint64_t prof_cycles[PROF_N];
+#define PROF_BEGIN() uint32_t prof_t_ = prof_now()
+#define PROF_END(sec) (prof_cycles[sec] += prof_now() - prof_t_)
+#define PROF(sec, ...) do { PROF_BEGIN(); __VA_ARGS__; PROF_END(sec); } while (0)
+#else
+#define PROF_BEGIN() do {} while (0)
+#define PROF_END(sec) do {} while (0)
+#define PROF(sec, ...) do { __VA_ARGS__; } while (0)
+#endif
+
 const char *model_open(Model *m, const uint8_t *image) {
     const ImageHeader *h = (const ImageHeader *)image;
     if (memcmp(h->magic, "LLMMODEL", 8) != 0) return "no model image (bad magic)";
@@ -41,19 +52,23 @@ uint32_t model_mat(const Model *m, int l, int which) {
     return m->mat_off[l < m->c.n_layers ? l * MATS_PER_LAYER + which : m->c.n_layers * MATS_PER_LAYER];
 }
 
+// The platform may put the small, hot buffers in faster memory; the KV cache
+// and the logits always come from calloc.
+__attribute__((weak)) void *fast_calloc(size_t n, size_t size) { return calloc(n, size); }
+
 int run_state_alloc(RunState *s, const Config *p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->xq = (QTensor){calloc(p->dim, 1), calloc(p->dim, sizeof(float))};
-    s->hq = (QTensor){calloc(p->hidden_dim, 1), calloc(p->hidden_dim, sizeof(float))};
-    s->q = calloc(p->dim, sizeof(float));
-    s->k = calloc(kv_dim, sizeof(float));
-    s->v = calloc(kv_dim, sizeof(float));
-    s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
+    s->x = fast_calloc(p->dim, sizeof(float));
+    s->xb = fast_calloc(p->dim, sizeof(float));
+    s->xb2 = fast_calloc(p->dim, sizeof(float));
+    s->hb = fast_calloc(p->hidden_dim, sizeof(float));
+    s->hb2 = fast_calloc(p->hidden_dim, sizeof(float));
+    s->xq = (QTensor){fast_calloc(p->dim, 1), fast_calloc(p->dim, sizeof(float))};
+    s->hq = (QTensor){fast_calloc(p->hidden_dim, 1), fast_calloc(p->hidden_dim, sizeof(float))};
+    s->q = fast_calloc(p->dim, sizeof(float));
+    s->k = fast_calloc(kv_dim, sizeof(float));
+    s->v = fast_calloc(kv_dim, sizeof(float));
+    s->att = fast_calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
@@ -115,14 +130,16 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
     for (int i = 0; i < dim; i++) x[i] = eq[i] * es[i / gs];
 
     for (int l = 0; l < p->n_layers; l++) {
-        rmsnorm(s->xb, x, m->rms_att + l * dim, dim);
+        PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_att + l * dim, dim));
 
-        quantize(&s->xq, s->xb, dim, gs);
-        qmatmul(s->q, &s->xq, model_mat(m, l, MAT_WQ), dim, dim);
-        qmatmul(s->k, &s->xq, model_mat(m, l, MAT_WK), dim, kv_dim);
-        qmatmul(s->v, &s->xq, model_mat(m, l, MAT_WV), dim, kv_dim);
+        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
+        PROF(PROF_MM, qmatmul(s->q, &s->xq, model_mat(m, l, MAT_WQ), dim, dim));
+        PROF(PROF_MM, qmatmul(s->k, &s->xq, model_mat(m, l, MAT_WK), dim, kv_dim));
+        PROF(PROF_MM, qmatmul(s->v, &s->xq, model_mat(m, l, MAT_WV), dim, kv_dim));
 
         // RoPE
+        {
+        PROF_BEGIN();
         for (int i = 0; i < dim; i += 2) {
             int head_dim = i % head_size;
             float freq = ROPE_FREQ(head_dim / (float)head_size);
@@ -138,57 +155,96 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
                 vec[i + 1] = v0 * fci + v1 * fcr;
             }
         }
+        PROF_END(PROF_ROPE);
+        }
 
         int loff = l * p->seq_len * kv_dim;
+        {
+        PROF_BEGIN();
         memcpy(s->key_cache + loff + pos * kv_dim, s->k, kv_dim * sizeof(float));
         memcpy(s->value_cache + loff + pos * kv_dim, s->v, kv_dim * sizeof(float));
 
+        // Four timesteps at a time: independent sums the CPU can overlap.
+        // Every sum still adds its terms in runq.c's order, so the results
+        // are the same bits.
+        float sqrt_hs = sqrtf(head_size);
         for (int h = 0; h < p->n_heads; h++) {
             const float *q = s->q + h * head_size;
             float *att = s->att + h * p->seq_len;
-            for (int t = 0; t <= pos; t++) {
-                const float *k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+            const float *kh = s->key_cache + loff + (h / kv_mul) * head_size;
+            int t = 0;
+            for (; t + 3 <= pos; t += 4) {
+                const float *k0 = kh + t * kv_dim, *k1 = k0 + kv_dim, *k2 = k1 + kv_dim,
+                            *k3 = k2 + kv_dim;
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    s0 += q[i] * k0[i];
+                    s1 += q[i] * k1[i];
+                    s2 += q[i] * k2[i];
+                    s3 += q[i] * k3[i];
+                }
+                att[t] = s0 / sqrt_hs;
+                att[t + 1] = s1 / sqrt_hs;
+                att[t + 2] = s2 / sqrt_hs;
+                att[t + 3] = s3 / sqrt_hs;
+            }
+            for (; t <= pos; t++) {
+                const float *k = kh + t * kv_dim;
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) score += q[i] * k[i];
-                score /= sqrtf(head_size);
-                att[t] = score;
+                att[t] = score / sqrt_hs;
             }
             softmax(att, pos + 1);
             float *xb = s->xb + h * head_size;
+            const float *vh = s->value_cache + loff + (h / kv_mul) * head_size;
             memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                const float *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+            t = 0;
+            for (; t + 3 <= pos; t += 4) {
+                const float *v0 = vh + t * kv_dim, *v1 = v0 + kv_dim, *v2 = v1 + kv_dim,
+                            *v3 = v2 + kv_dim;
+                float a0 = att[t], a1 = att[t + 1], a2 = att[t + 2], a3 = att[t + 3];
+                for (int i = 0; i < head_size; i++)
+                    xb[i] = (((xb[i] + a0 * v0[i]) + a1 * v1[i]) + a2 * v2[i]) + a3 * v3[i];
+            }
+            for (; t <= pos; t++) {
+                const float *v = vh + t * kv_dim;
                 float a = att[t];
                 for (int i = 0; i < head_size; i++) xb[i] += a * v[i];
             }
         }
+        PROF_END(PROF_ATT);
+        }
 
-        quantize(&s->xq, s->xb, dim, gs);
-        qmatmul(s->xb2, &s->xq, model_mat(m, l, MAT_WO), dim, dim);
+        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
+        PROF(PROF_MM, qmatmul(s->xb2, &s->xq, model_mat(m, l, MAT_WO), dim, dim));
         for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
 
-        rmsnorm(s->xb, x, m->rms_ffn + l * dim, dim);
+        PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_ffn + l * dim, dim));
 
-        quantize(&s->xq, s->xb, dim, gs);
-        qmatmul(s->hb, &s->xq, model_mat(m, l, MAT_W1), dim, hidden_dim);
-        qmatmul(s->hb2, &s->xq, model_mat(m, l, MAT_W3), dim, hidden_dim);
+        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
+        PROF(PROF_MM, qmatmul(s->hb, &s->xq, model_mat(m, l, MAT_W1), dim, hidden_dim));
+        PROF(PROF_MM, qmatmul(s->hb2, &s->xq, model_mat(m, l, MAT_W3), dim, hidden_dim));
 
         // SwiGLU
+        {
+        PROF_BEGIN();
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
             val *= (1.0f / (1.0f + EXPF(-val)));
             val *= s->hb2[i];
             s->hb[i] = val;
         }
+        PROF_END(PROF_FFN);
+        }
 
-        quantize(&s->hq, s->hb, hidden_dim, gs);
-        qmatmul(s->xb, &s->hq, model_mat(m, l, MAT_W2), hidden_dim, dim);
+        PROF(PROF_QUANT, quantize(&s->hq, s->hb, hidden_dim, gs));
+        PROF(PROF_MM, qmatmul(s->xb, &s->hq, model_mat(m, l, MAT_W2), hidden_dim, dim));
         for (int i = 0; i < dim; i++) x[i] += s->xb[i];
     }
 
-    rmsnorm(x, x, m->rms_final, dim);
-    quantize(&s->xq, x, dim, gs);
-    qmatmul(s->logits, &s->xq, model_mat(m, p->n_layers, 0), dim, p->vocab_size);
+    PROF(PROF_NORM, rmsnorm(x, x, m->rms_final, dim));
+    PROF(PROF_QUANT, quantize(&s->xq, x, dim, gs));
+    PROF(PROF_MM, qmatmul(s->logits, &s->xq, model_mat(m, p->n_layers, 0), dim, p->vocab_size));
     return s->logits;
 }
 

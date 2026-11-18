@@ -51,8 +51,16 @@ const char *model_open(Model *m, const uint8_t *image);
 // offset of matrix `which` of layer l (l = n_layers: the classifier)
 uint32_t model_mat(const Model *m, int l, int which);
 int run_state_alloc(RunState *s, const Config *c);
+// weak, calloc by default; a platform can override it (fw/llm: local memory)
+void *fast_calloc(size_t n, size_t size);
 float *forward(const Model *m, RunState *s, int token, int pos);
 int sample_argmax(const float *p, int n);
+
+// With MODEL_PROFILE, forward() adds the cycles of each part to prof_cycles
+// (prof_now() from the platform).
+enum { PROF_NORM, PROF_QUANT, PROF_MM, PROF_ROPE, PROF_ATT, PROF_FFN, PROF_N };
+extern uint64_t prof_cycles[PROF_N];
+uint32_t prof_now(void);
 
 // Provided by the platform: y[d] = W x, W the matrix at image offset w_off
 // (qmv DDR format, n inputs, d outputs), x quantized in groups of 32.
