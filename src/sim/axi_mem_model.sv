@@ -6,6 +6,7 @@
 // back-pressure. Multiple outstanding reads are served in order.
 //
 // mem is one 256-bit word per 32 bytes; testbenches can load it directly.
+// Writes honor the byte strobes.
 module axi_mem_model #(
     parameter int AddrW = 30,
     parameter int Words = 1 << 16  // 2 MB
@@ -17,6 +18,7 @@ module axi_mem_model #(
     input wire logic awvalid_i,
     output logic awready_o,
     input wire logic [255:0] wdata_i,
+    input wire logic [31:0] wstrb_i,
     input wire logic wlast_i,
     input wire logic wvalid_i,
     output logic wready_o,
@@ -110,7 +112,8 @@ module axi_mem_model #(
           $display("AXI ERROR: W beat before AW");
           errors++;
         end else begin
-          mem[(aw_addr_q[0]+w_beat)%Words] <= wdata_i;
+          for (int b = 0; b < 32; b++)
+            if (wstrb_i[b]) mem[(aw_addr_q[0]+w_beat)%Words][8*b+:8] <= wdata_i[8*b+:8];
           w_beat++;
           if (wlast_i) begin
             void'(aw_addr_q.pop_front());

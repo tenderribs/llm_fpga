@@ -86,6 +86,7 @@ module tb_sd_ctrl #(
       .awvalid_i(awvalid),
       .awready_o(awready),
       .wdata_i(wdata),
+      .wstrb_i('1),
       .wlast_i(1'b1),
       .wvalid_i(wvalid),
       .wready_o(wready),

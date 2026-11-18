@@ -6,7 +6,7 @@
 // attn A RAM write capture; every result checked bit for bit.
 module tb_vpu #(
     parameter string VecDir = "",
-    parameter int Op = 1,  // 1 QUANT, 2 SILU, 3 SOFTMAX
+    parameter int Op = 1,  // 0 COPY, 1 QUANT, 2 SILU, 3 SOFTMAX
     parameter int N = 32,
     parameter int NIn = 32,
     parameter int NOut = 2,
@@ -17,16 +17,18 @@ module tb_vpu #(
 
   logic start, busy, done;
   logic [14:0] y_addr;
-  logic [11:0] v_addr, a_addr;
+  logic [12:0] v_addr;
+  logic [11:0] a_addr;
   logic [5:0] xq_addr, xs_addr;
   logic y_we, v_we, xq_we, xs_we, a_we;
   logic [31:0] y_wdata, v_wdata, y_rdata, v_rdata, xs_data, a_data;
   logic [255:0] xq_data;
 
   // QUANT reads x from V (at 100), SILU a / b from Y (at 0 / 1000) into V
-  // at 200, SOFTMAX scores from Y (at 0) with V at 300 as scratch
+  // at 200, SOFTMAX scores from Y (at 0) with V at 300 as scratch, COPY
+  // from V at 5000
   localparam int SrcV = (Op == 1);
-  localparam int Src = (Op == 1) ? 100 : 0;
+  localparam int Src = (Op == 1) ? 100 : (Op == 0) ? 5000 : 0;
   localparam int Src2 = 1000;
   localparam int Dst = (Op == 2) ? 200 : 300;
 
@@ -42,14 +44,14 @@ module tb_vpu #(
   );
 
   logic [31:0] yram[32768];
-  logic [31:0] vram[4096];
+  logic [31:0] vram[8192];
   logic [255:0] xq[64];
   logic [31:0] xs[64];
   logic [31:0] aram[4096];
   // like llm_core: address, write enable and data registered, then the RAM
   logic y_we_q, v_we_q;
   logic [14:0] y_addr_q;
-  logic [11:0] v_addr_q;
+  logic [12:0] v_addr_q;
   logic [31:0] y_wdata_q, v_wdata_q;
   always_ff @(posedge clk) begin
     y_we_q <= y_we;
@@ -77,7 +79,7 @@ module tb_vpu #(
     if (Op == 1) $readmemh({VecDir, "/out.hex"}, out_l, 0, N / 32 - 1);
     $readmemh({VecDir, "/out.hex"}, out_w);
     for (int i = 0; i < NIn; i++) begin
-      if (Op == 1) vram[Src+i] = in_w[i];
+      if (Op == 1 || Op == 0) vram[Src+i] = in_w[i];
       else if (Op == 2) begin
         if (i < N) yram[Src+i] = in_w[i];
         else yram[Src2+i-N] = in_w[i];

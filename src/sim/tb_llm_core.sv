@@ -47,6 +47,7 @@ module tb_llm_core #(
   logic awvalid, awready, wlast, wvalid, wready, bvalid, bready;
   logic arvalid, arready, rvalid, rready;
   logic [255:0] wdata, rdata;
+  logic [31:0] wstrb;
   logic sd_power_n, sd_sclk, sd_cs, sd_mosi, sd_miso;
   logic [17:0] s_awaddr, s_araddr;
   logic s_awvalid, s_awready, s_wvalid, s_wready, s_bvalid, s_bready;
@@ -74,6 +75,7 @@ module tb_llm_core #(
       .m_awvalid_o(awvalid),
       .m_awready_i(awready),
       .m_wdata_o(wdata),
+      .m_wstrb_o(wstrb),
       .m_wlast_o(wlast),
       .m_wvalid_o(wvalid),
       .m_wready_i(wready),
@@ -207,6 +209,7 @@ module tb_llm_core #(
       .awvalid_i(awvalid),
       .awready_o(awready),
       .wdata_i(wdata),
+      .wstrb_i(wstrb),
       .wlast_i(wlast),
       .wvalid_i(wvalid),
       .wready_o(wready),
@@ -565,9 +568,9 @@ module tb_llm_core #(
       localparam int HsA = 48, NtA = 37;
       logic [31:0] v;
       logic [31:0] a_vals[HsA > NtA ? HsA : NtA];
-      logic [255:0] kv[3 * HsA * 2];
-      logic [31:0] y_att[48];
-      int nbeats = mode ? NtA * HsA / 8 : 3 * HsA * 2;
+      logic [255:0] kv[128 * HsA / 8];
+      logic [31:0] y_att[128];
+      int nbeats = mode ? NtA * HsA / 8 : 128 * HsA / 8;
       int base_word = mode ? 32'h1A0000 / 32 : 32'h180000 / 32;
       int errs = 0;
       string dir = mode ? VecDirAttW : VecDirAttS;
@@ -598,7 +601,7 @@ module tb_llm_core #(
     begin
       logic [31:0] v;
       logic [31:0] xfw[2048];
-      logic [31:0] y_att[48];
+      logic [31:0] y_att[128];
       int errs = 0;
       // wipe x in the engine
       begin
@@ -674,6 +677,48 @@ module tb_llm_core #(
       errors += errs;
     end
 
+    // 9. DMA job: 16 words from V to DDR as whole beats, then 5 words
+    //    scattered every 512 bytes (byte strobes)
+    begin
+      logic [31:0] v;
+      int errs = 0;
+      for (int i = 0; i < 21; i++) begin
+        @(negedge clk);
+        yb_addr = 32'h0012_0000 + 32'(4 * (6000 + i));
+        yb_din = 32'hD0D0_0000 + 32'(i);
+        yb_we = 4'hF;
+        yb_en = 1;
+        @(negedge clk);
+        yb_en = 0;
+        yb_we = 0;
+      end
+      for (int w = 0; w < 128; w++) u_mem.mem[32'h0030_0000/32+w] = '0;
+      axil_write(18'h00068, 32'd6000);
+      axil_write(18'h0006C, 32'd16);
+      axil_write(18'h00070, 32'h0030_0000);
+      axil_write(18'h00074, 32'd4);
+      axil_write(18'h00078, 32'd1);
+      do axil_read(18'h00004, v); while (v[8]);
+      axil_write(18'h00068, 32'd6016);
+      axil_write(18'h0006C, 32'd5);
+      axil_write(18'h00070, 32'h0030_0404);  // word 1 of beat 32
+      axil_write(18'h00074, 32'd512);
+      axil_write(18'h00078, 32'd1);
+      do axil_read(18'h00004, v); while (v[8]);
+      for (int i = 0; i < 16; i++)
+        if (u_mem.mem[32'h0030_0000/32+i/8][32*(i%8)+:32] !== 32'hD0D0_0000 + 32'(i)) errs++;
+      for (int k = 0; k < 5; k++) begin
+        logic [255:0] b;
+        b = u_mem.mem[32'h0030_0400/32+16*k];
+        if (b !== {192'd0, 32'hD0D0_0010 + 32'(k), 32'd0}) begin
+          if (errs < 5) $display("MISMATCH DMA scatter %0d: %h", k, b);
+          errs++;
+        end
+      end
+      $display("DMA V -> DDR: %0d mismatches", errs);
+      errors += errs;
+    end
+
     repeat (100) @(posedge clk);
     if (rx_bytes.size() != 0) begin
       $display("MISMATCH %0d extra reply bytes", rx_bytes.size());
@@ -687,8 +732,8 @@ module tb_llm_core #(
       $display("MISMATCH %0d SD protocol errors", u_card.errors);
       errors++;
     end
-    if (led[7:4] !== 4'd11) begin
-      $display("MISMATCH job LEDs %0d, exp 11", led[7:4]);
+    if (led[7:4] !== 4'd13) begin
+      $display("MISMATCH job LEDs %0d, exp 13", led[7:4]);
       errors++;
     end
 

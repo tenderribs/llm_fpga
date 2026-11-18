@@ -40,7 +40,8 @@
 //   0x00020 SD_ADDR     where it was loaded
 //   0x00024 CYCLES      free-running clock cycle counter
 //   0x00030 AT_ADDR     attention: DDR address of the head's K or V (2 KB
-//                       aligned), see attn.sv for the layouts
+//                       aligned), see attn.sv for the layouts (K in blocks
+//                       of 128 timesteps)
 //   0x00034 AT_CFG      head_size | timesteps << 16
 //   0x00038 AT_START    write 0: scores q.k_t into Y[t]; write 1: weighted
 //                       sum a.V into Y[i]
@@ -57,6 +58,12 @@
 //   0x0005C VPU_SRC2    SILU: second source (Y)
 //   0x00060 VPU_DST     destination / scratch in V
 //   0x00064 VPU_F       SOFTMAX: divisor (float32)
+//   0x00068 DMA_SRC     DMA job, V RAM -> DDR: first V word
+//   0x0006C DMA_N       words (stride 4: a multiple of 8)
+//   0x00070 DMA_DST     DDR byte address (stride 4: 32-byte aligned)
+//   0x00074 DMA_STRIDE  DDR bytes from one word to the next: 4 writes
+//                       whole 32-byte beats, else one word per write
+//   0x00078 DMA_START   any write: run it
 //   0x01000 XQ          W: x.q, word i = bytes 4i..4i+3 (write in order;
 //                       every 8th word completes a 32-byte line)
 //   0x01800 XS          W: x.s, word g = the scale of group g
@@ -67,7 +74,7 @@
 // CONSOLE_IN has a byte.
 // yb_* is a block RAM port on another clock, the CPU's local memory bus
 // (data one cycle after yb_en_i): byte address bit 17 clear reads the Y RAM,
-// set reads and writes the V RAM (4096 words, the vector unit's).
+// set reads and writes the V RAM (8192 words, the vector unit's).
 // The console is sent only between UART commands, so host tools and
 // firmware output don't interleave mid-reply. A CPU matmul starts when no
 // UART command is running and holds off new ones until it is done.
@@ -99,6 +106,7 @@ module llm_core #(
     output logic m_awvalid_o,
     input wire logic m_awready_i,
     output logic [255:0] m_wdata_o,
+    output logic [31:0] m_wstrb_o,
     output logic m_wlast_o,
     output logic m_wvalid_o,
     input wire logic m_wready_i,
@@ -156,6 +164,7 @@ module llm_core #(
   logic c_awvalid, c_awready, c_wlast, c_wvalid, c_wready, c_bvalid, c_bready;
   logic c_arvalid, c_arready, c_rvalid, c_rready;
   logic [255:0] c_wdata, c_rdata, sd_wdata;
+  logic [31:0] c_wstrb;
   logic sd_awvalid, sd_wvalid, sd_bready, sd_arvalid, sd_rready;
   logic sd_busy, sd_ok, sd_err;
   logic [3:0] sd_err_code;
@@ -168,6 +177,7 @@ module llm_core #(
   assign m_awlen_o   = sd_busy ? 8'd0 : c_awlen;
   assign m_awvalid_o = sd_busy ? sd_awvalid : c_awvalid;
   assign m_wdata_o   = sd_busy ? sd_wdata : c_wdata;
+  assign m_wstrb_o   = sd_busy ? '1 : c_wstrb;
   assign m_wlast_o   = sd_busy ? 1'b1 : c_wlast;
   assign m_wvalid_o  = sd_busy ? sd_wvalid : c_wvalid;
   assign m_bready_o  = sd_busy ? sd_bready : c_bready;
@@ -328,7 +338,9 @@ module llm_core #(
     S_CPU_RUN,    // CPU matmul: running, results to the Y RAM
     S_CPU_ATT,    // CPU attention job: running, results to the Y RAM
     S_CIN,        // CONSOLE_IN: receiving bytes for the CPU
-    S_CPU_VPU     // CPU vector unit job: running
+    S_CPU_VPU,    // CPU vector unit job: running
+    S_DMA_RD,     // DMA job: reading V words
+    S_DMA_AXI     // DMA job: one beat on AW / W, waiting for B
   } state_t;
   state_t state_q;
 
@@ -364,17 +376,34 @@ module llm_core #(
   logic [14:0] vpu_y_addr;
   logic vpu_y_we, vpu_v_we, vpu_xq_we, vpu_xs_we, vpu_a_we;
   logic [31:0] vpu_y_wdata, vpu_v_wdata, vpu_v_rdata, vpu_xs_data, vpu_a_data;
-  logic [11:0] vpu_v_addr, vpu_a_addr;
+  logic [12:0] vpu_v_addr;
+  logic [11:0] vpu_a_addr;
   logic [5:0] vpu_xq_addr, vpu_xs_addr;
   logic [255:0] vpu_xq_data;
   logic [31:0] yram_rdata;
+  // DMA job (V RAM -> DDR)
+  logic cpu_dma_start_q;
+  logic [12:0] cpu_dma_src_q;
+  logic [15:0] cpu_dma_n_q;
+  logic [31:0] cpu_dma_dst_q, cpu_dma_stride_q;
+  logic [12:0] dma_vaddr_q;  // next V word to read
+  logic [3:0] dma_iss_q, dma_got_q;  // words of this beat read / arrived
+  logic [1:0] dma_dv_q;  // reads in flight (V data two cycles later)
+  logic dma_rd;
+  assign dma_rd = (state_q == S_DMA_RD) && (dma_iss_q != (dma_stride4_q ? 4'd8 : 4'd1));
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) dma_dv_q <= '0;
+    else dma_dv_q <= {dma_dv_q[0], dma_rd};
+  end
+  logic [31:0] dma_strb_q;
+  logic dma_stride4_q;
 
   // its DDR beats from AT_CFG (stable long before the job starts)
   logic [11:0] at_nblk_q;
   logic [31:0] at_beats_k_q, at_beats_v_q;
   always_ff @(posedge clk_i) begin
-    at_nblk_q <= 12'((cpu_at_cfg_q[31:16] + 16'd15) >> 4);
-    at_beats_k_q <= 32'(at_nblk_q) * 32'(cpu_at_cfg_q[8:0]) * 2;
+    at_nblk_q <= 12'((cpu_at_cfg_q[31:16] + 16'd127) >> 7);
+    at_beats_k_q <= 32'(at_nblk_q) * 32'(cpu_at_cfg_q[8:0]) * 16;
     at_beats_v_q <= 32'(cpu_at_cfg_q[31:16]) * 32'(cpu_at_cfg_q[8:0]) / 8;
   end
   logic cons_empty, cons_full, cons_we;
@@ -579,13 +608,14 @@ module llm_core #(
   assign hdr_w1 = rx_buf_q[31:28];
 
   // AXI write: one beat at a time
-  assign c_awaddr  = addr_q;
+  assign c_awaddr  = {addr_q[AddrW-1:5], 5'd0};  // DMA words: the strobes pick the bytes
   assign c_awlen   = 8'd0;
-  assign c_awvalid = (state_q == S_WR_AXI) && !aw_done_q;
+  assign c_awvalid = (state_q == S_WR_AXI || state_q == S_DMA_AXI) && !aw_done_q;
   assign c_wdata   = beat_q;
+  assign c_wstrb   = (state_q == S_DMA_AXI) ? dma_strb_q : '1;
   assign c_wlast   = 1'b1;
-  assign c_wvalid  = (state_q == S_WR_AXI) && !w_done_q;
-  assign c_bready  = (state_q == S_WR_AXI);
+  assign c_wvalid  = (state_q == S_WR_AXI || state_q == S_DMA_AXI) && !w_done_q;
+  assign c_bready  = (state_q == S_WR_AXI || state_q == S_DMA_AXI);
 
   // AXI read: single beats for READ, otherwise the weight reader
   always_comb begin
@@ -738,6 +768,14 @@ module llm_core #(
               cpu_vpu_q <= 1'b1;
               vpu_start <= 1'b1;
               state_q <= S_CPU_VPU;
+            end else if (cpu_dma_start_q && !sd_busy) begin
+              count_q <= 32'(cpu_dma_n_q);
+              addr_q <= AddrW'(cpu_dma_dst_q);
+              dma_vaddr_q <= cpu_dma_src_q;
+              dma_stride4_q <= (cpu_dma_stride_q == 32'd4);
+              dma_iss_q <= '0;
+              dma_got_q <= '0;
+              state_q <= (cpu_dma_n_q == 16'd0) ? S_OP : S_DMA_RD;
             end
           end
 
@@ -759,6 +797,47 @@ module llm_core #(
 
           S_CPU_VPU: begin
             if (vpu_done) state_q <= S_FLUSH;
+          end
+
+          // read a beat's words (8 for stride 4, else 1) from V, then write it
+          S_DMA_RD: begin
+            if (dma_rd) begin
+              dma_iss_q <= dma_iss_q + 1;
+              dma_vaddr_q <= dma_vaddr_q + 1;
+            end
+            if (dma_dv_q[1]) begin
+              if (dma_stride4_q) beat_q[32*dma_got_q[2:0]+:32] <= vpu_v_rdata;
+              else beat_q <= {8{vpu_v_rdata}};
+              dma_got_q <= dma_got_q + 1;
+              if (dma_got_q + 1 == (dma_stride4_q ? 4'd8 : 4'd1)) begin
+                dma_strb_q <= dma_stride4_q ? '1 : (32'hF << {addr_q[4:2], 2'b00});
+                aw_done_q <= 1'b0;
+                w_done_q <= 1'b0;
+                state_q <= S_DMA_AXI;
+              end
+            end
+          end
+
+          S_DMA_AXI: begin
+            if (c_awvalid && c_awready) aw_done_q <= 1'b1;
+            if (c_wvalid && c_wready) w_done_q <= 1'b1;
+            if (c_bvalid) begin
+              dma_iss_q <= '0;
+              dma_got_q <= '0;
+              if (dma_stride4_q) begin
+                addr_q <= addr_q + 32;
+                count_q <= count_q - 8;
+              end else begin
+                addr_q <= addr_q + AddrW'(cpu_dma_stride_q);
+                count_q <= count_q - 1;
+              end
+              if (count_q == (dma_stride4_q ? 32'd8 : 32'd1)) begin
+                jobs_q <= jobs_q + 1;
+                state_q <= S_OP;
+              end else begin
+                state_q <= S_DMA_RD;
+              end
+            end
           end
 
           S_CPU_ATT: begin
@@ -1016,7 +1095,7 @@ module llm_core #(
 
   // result RAM
   logic [31:0] yram[YWords];
-  logic [31:0] vram[4096];
+  logic [31:0] vram[8192];
   // port A (this clock): the vector unit while it runs, else results from
   // the attention unit / the matmul, else the AXI4-Lite Y window's reads
   logic ya_we;
@@ -1054,12 +1133,13 @@ module llm_core #(
     yram_rdata <= yram[ya_addr_q];
   end
   // V RAM port A: the vector unit, registered the same way
+  // (the DMA job reads it here too)
   logic va_we_q;
-  logic [11:0] va_addr_q;
+  logic [12:0] va_addr_q;
   logic [31:0] va_wdata_q;
   always_ff @(posedge clk_i) begin
-    va_we_q <= vpu_v_we;
-    va_addr_q <= vpu_v_addr;
+    va_we_q <= vpu_v_we && !dma_rd;
+    va_addr_q <= dma_rd ? dma_vaddr_q : vpu_v_addr;
     va_wdata_q <= vpu_v_wdata;
     if (va_we_q) vram[va_addr_q] <= va_wdata_q;
     vpu_v_rdata <= vram[va_addr_q];
@@ -1071,9 +1151,9 @@ module llm_core #(
     if (yb_en_i) begin
       yb_sel_q <= yb_addr_i[17];
       yb_y_q <= yram[yb_addr_i[$clog2(YWords)+1:2]];
-      yb_v_q <= vram[yb_addr_i[13:2]];
+      yb_v_q <= vram[yb_addr_i[14:2]];
       for (int b = 0; b < 4; b++)
-        if (yb_addr_i[17] && yb_we_i[b]) vram[yb_addr_i[13:2]][8*b+:8] <= yb_din_i[8*b+:8];
+        if (yb_addr_i[17] && yb_we_i[b]) vram[yb_addr_i[14:2]][8*b+:8] <= yb_din_i[8*b+:8];
     end
   end
   assign yb_dout_o = yb_sel_q ? yb_v_q : yb_y_q;
@@ -1108,6 +1188,7 @@ module llm_core #(
       at_a_we_q <= 1'b0;
       cpu_vpu_start_q <= 1'b0;
       mm_yoff_q <= '0;
+      cpu_dma_start_q <= 1'b0;
     end else begin
       cycles_q <= cycles_q + 1;
       cpu_xq_we_q <= 1'b0;
@@ -1121,6 +1202,9 @@ module llm_core #(
       if (state_q == S_OP && !rx_valid && !(cpu_start_q && !sd_busy) &&
           !(cpu_at_start_q && !sd_busy) && cpu_vpu_start_q)
         cpu_vpu_start_q <= 1'b0;
+      if (state_q == S_OP && !rx_valid && !(cpu_start_q && !sd_busy) &&
+          !(cpu_at_start_q && !sd_busy) && !cpu_vpu_start_q && cpu_dma_start_q && !sd_busy)
+        cpu_dma_start_q <= 1'b0;
 
       if (wr_fire) begin
         if (s_awaddr_i == 18'h00010) cpu_addr_q <= s_wdata_i;
@@ -1143,6 +1227,11 @@ module llm_core #(
         if (s_awaddr_i == 18'h0005C) cpu_vpu_src2_q <= s_wdata_i[15:0];
         if (s_awaddr_i == 18'h00060) cpu_vpu_dst_q <= s_wdata_i[15:0];
         if (s_awaddr_i == 18'h00064) cpu_vpu_f_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00068) cpu_dma_src_q <= s_wdata_i[12:0];
+        if (s_awaddr_i == 18'h0006C) cpu_dma_n_q <= s_wdata_i[15:0];
+        if (s_awaddr_i == 18'h00070) cpu_dma_dst_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00074) cpu_dma_stride_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00078) cpu_dma_start_q <= 1'b1;
         if (s_awaddr_i[17:14] == 4'b0001) begin  // 0x04000..0x07FFF: AT_A
           at_a_we_q <= 1'b1;
           at_a_addr_q <= s_awaddr_i[13:2];
@@ -1194,7 +1283,8 @@ module llm_core #(
             18'h00004:
             s_rdata_o <= {21'd0, !cin_empty, cons_full,
                           cpu_start_q || cpu_mm_q || cpu_at_start_q || cpu_at_q ||
-                          cpu_vpu_start_q || cpu_vpu_q,
+                          cpu_vpu_start_q || cpu_vpu_q || cpu_dma_start_q ||
+                          state_q == S_DMA_RD || state_q == S_DMA_AXI,
                           sd_err_code, sd_err, sd_ok,
                           sd_busy, calib_done_i};
             18'h00010: s_rdata_o <= cpu_addr_q;

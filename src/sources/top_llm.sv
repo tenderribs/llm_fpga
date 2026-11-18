@@ -52,6 +52,7 @@ module top_llm #(
   logic awvalid, awready, wlast, wvalid, wready, bvalid, bready;
   logic arvalid, arready, rvalid, rready, rlast;
   logic [255:0] wdata, rdata;
+  logic [31:0] wstrb;
   logic [2:0] bid, rid;
   logic [1:0] bresp, rresp;
 
@@ -95,7 +96,7 @@ module top_llm #(
       .s_axi_awvalid(awvalid),
       .s_axi_awready(awready),
       .s_axi_wdata(wdata),
-      .s_axi_wstrb({32{1'b1}}),
+      .s_axi_wstrb(wstrb),
       .s_axi_wlast(wlast),
       .s_axi_wvalid(wvalid),
       .s_axi_wready(wready),
@@ -148,6 +149,7 @@ module top_llm #(
       .m_awvalid_o(awvalid),
       .m_awready_i(awready),
       .m_wdata_o(wdata),
+      .m_wstrb_o(wstrb),
       .m_wlast_o(wlast),
       .m_wvalid_o(wvalid),
       .m_wready_i(wready),

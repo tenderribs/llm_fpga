@@ -5,7 +5,7 @@ directory, the expected sums computed in float32 in runq.c's order.
   a.hex      the A RAM words (q for scores, the weights a for the weighted sum)
   beats.hex  the K / V beats as the unit reads them (256-bit, lane 0 in the
              low 32 bits)
-  y.hex      expected results by index (scores: padded to a multiple of 16)
+  y.hex      expected results by index (scores: padded to a multiple of 128)
 
 usage: python3 sim/gen_attn.py OUTDIR   (writes OUTDIR/<case>/ and prints
        the tb parameters of each case)
@@ -25,6 +25,9 @@ CASES = [  # name, mode, hs, nt
     ("w48_1", 1, 48, 1),
     ("w64_100", 1, 64, 100),
     ("w16_20", 1, 16, 20),
+    ("s48_200", 0, 48, 200),
+    ("s16_129", 0, 16, 129),
+    ("w8_9", 1, 8, 9),
 ]
 
 
@@ -42,17 +45,17 @@ def gen(out: Path, name: str, mode: int, hs: int, nt: int, rng) -> str:
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
     if mode == 0:
-        nblk = (nt + 15) // 16
+        nblk = (nt + 127) // 128
         q = rng.standard_normal(hs).astype(f32)
-        k = (rng.standard_normal((nblk * 16, hs)) * 0.7).astype(f32)  # rows past nt: padding
-        y = np.empty(nblk * 16, f32)
-        for t in range(nblk * 16):
+        k = (rng.standard_normal((nblk * 128, hs)) * 0.7).astype(f32)  # rows past nt: padding
+        y = np.empty(nblk * 128, f32)
+        for t in range(nblk * 128):
             s = f32(0.0)
             for i in range(hs):
                 s = f32(s + f32(q[i] * k[t, i]))
             y[t] = s
-        # [blk][i][t % 16]
-        stream = k.reshape(nblk, 16, hs).transpose(0, 2, 1).reshape(-1)
+        # [blk][i][t % 128]
+        stream = k.reshape(nblk, 128, hs).transpose(0, 2, 1).reshape(-1)
         a = q
     else:
         a = rng.random(nt).astype(f32)

@@ -106,6 +106,9 @@ def main() -> int:
         y = (rng.standard_normal(n) * 8).astype(f32)
         write(f"softmax{n}", 3, n, words(y), words(softmax_scaled(y, d)))
 
+    x = rng.standard_normal(48).astype(f32)
+    write("copy48", 0, 48, words(x), words(x))
+
     for c in cases:
         print(c, f"{int(bits(d)):08x}")
     return 0

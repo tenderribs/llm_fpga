@@ -63,6 +63,7 @@ module top_soc #(
   logic c_awvalid, c_awready, c_wlast, c_wvalid, c_wready, c_bvalid, c_bready;
   logic c_arvalid, c_arready, c_rvalid, c_rready;
   logic [255:0] c_wdata, c_rdata;
+  logic [31:0] c_wstrb;
 
   // CPU local memory bus -> llm_core's Y RAM (read) and V RAM (read / write)
   logic yb_clk, yb_en;
@@ -102,7 +103,7 @@ module top_soc #(
       .S_AXI_EXT_awvalid(c_awvalid),
       .S_AXI_EXT_awready(c_awready),
       .S_AXI_EXT_wdata(c_wdata),
-      .S_AXI_EXT_wstrb({32{1'b1}}),
+      .S_AXI_EXT_wstrb(c_wstrb),
       .S_AXI_EXT_wlast(c_wlast),
       .S_AXI_EXT_wvalid(c_wvalid),
       .S_AXI_EXT_wready(c_wready),
@@ -205,6 +206,7 @@ module top_soc #(
       .m_awvalid_o(c_awvalid),
       .m_awready_i(c_awready),
       .m_wdata_o(c_wdata),
+      .m_wstrb_o(c_wstrb),
       .m_wlast_o(c_wlast),
       .m_wvalid_o(c_wvalid),
       .m_wready_i(c_wready),
