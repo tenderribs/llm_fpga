@@ -1,4 +1,4 @@
-## top_llm only (scripts/build.tcl reads this file for that design).
+## top_llm and top_soc (scripts/build.tcl reads this file for those designs).
 ## Pins from board_support/digilent-xdc/Genesys-2-Master.xdc.
 
 ## microSD slot, SPI mode: DAT3 = chip select, CMD = MOSI, DAT0 = MISO

@@ -22,6 +22,33 @@
 //   flags: 0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error, 4 card detect pin
 // SD_LOAD also runs by itself once the DDR has calibrated. While an SD
 // operation runs only STATUS is answered; other commands are dropped.
+//
+// CPU side (AXI4-Lite slave, s_axil_*), byte offsets:
+//   0x00000 ID          "LLM1" (0x314D4C4C)
+//   0x00004 STATUS      0 DDR calibrated, 1 SD busy, 2 SD ok, 3 SD error,
+//                       7:4 SD error code, 8 matmul busy, 9 console full
+//   0x00008 CONSOLE     W: byte to send on the UART (dropped when full)
+//   0x00010 MM_ADDR     W (DDR address, from 0) in qmv DDR format
+//   0x00014 MM_ND       n | d << 16
+//   0x00018 MM_START    any write: run y = W @ x; results go to Y
+//   0x0001C SD_BYTES    size of the image the SD card loaded
+//   0x00020 SD_ADDR     where it was loaded
+//   0x00024 CYCLES      free-running clock cycle counter
+//   0x00030 AT_ADDR     attention: DDR address of the head's K or V (2 KB
+//                       aligned), see attn.sv for the layouts
+//   0x00034 AT_CFG      head_size | timesteps << 16
+//   0x00038 AT_START    write 0: scores q.k_t into Y[t]; write 1: weighted
+//                       sum a.V into Y[i]
+//   0x01000 XQ          W: x.q, word i = bytes 4i..4i+3 (write in order;
+//                       every 8th word completes a 32-byte line)
+//   0x01800 XS          W: x.s, word g = the scale of group g
+//   0x04000 AT_A        W: attention's A RAM, word i: q[i] (scores) or
+//                       a[t] (weighted sum), up to 4096 words
+//   0x20000 Y           R: y, word i = row i (up to 32768 rows)
+// STATUS bit 8 (busy) covers attention jobs too.
+// The console is sent only between UART commands, so host tools and
+// firmware output don't interleave mid-reply. A CPU matmul starts when no
+// UART command is running and holds off new ones until it is done.
 // If the host stops partway through a command for IdleTimeoutClks, it is
 // dropped and the next byte is read as an opcode.
 module llm_core #(
@@ -69,7 +96,23 @@ module llm_core #(
     output logic sd_cs_o,
     output logic sd_mosi_o,
     input wire logic sd_miso_i,
-    input wire logic sd_cd_i
+    input wire logic sd_cd_i,
+
+    // CPU registers, AXI4-Lite
+    input wire logic [17:0] s_awaddr_i,
+    input wire logic s_awvalid_i,
+    output logic s_awready_o,
+    input wire logic [31:0] s_wdata_i,
+    input wire logic s_wvalid_i,
+    output logic s_wready_o,
+    output logic s_bvalid_o,
+    input wire logic s_bready_i,
+    input wire logic [17:0] s_araddr_i,
+    input wire logic s_arvalid_i,
+    output logic s_arready_o,
+    output logic [31:0] s_rdata_o,
+    output logic s_rvalid_o,
+    input wire logic s_rready_i
 );
 
   localparam int P = 32;
@@ -235,7 +278,7 @@ module llm_core #(
   );
 
   // Command state (the state machine is further down)
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     S_OP,         // waiting for an opcode
     S_HDR,        // receiving header bytes
     S_STATUS,     // sending the status reply
@@ -249,13 +292,46 @@ module llm_core #(
     S_MM_XS,      // MATMUL: receiving x.s
     S_MM_RUN,     // MATMUL: running, results going out
     S_FLUSH,      // after an abort: wait for DDR reads in flight
-    S_SD_ACK      // reply to SD_LOAD / SD_STORE
+    S_SD_ACK,     // reply to SD_LOAD / SD_STORE
+    S_CPU_PREP,   // CPU matmul / attention: wait for the beat count
+    S_CPU_RUN,    // CPU matmul: running, results to the Y RAM
+    S_CPU_ATT     // CPU attention job: running, results to the Y RAM
   } state_t;
   state_t state_q;
 
   // ---------------------------------------------------------------------------
   // Matmul engine and its weight stream
   // ---------------------------------------------------------------------------
+  // CPU side: state used by the matmul path (logic further down)
+  logic cpu_mm_q;  // the running matmul is the CPU's
+  logic cpu_xq_we_q, cpu_xs_we_q;
+  logic [$clog2(MaxN/P)-1:0] cpu_xq_addr_q;
+  logic [$clog2(MaxN/GS)-1:0] cpu_xs_addr_q;
+  logic [255:0] cpu_xq_data_q;
+  logic [31:0] cpu_xs_data_q;
+  logic [31:0] cpu_addr_q, cpu_nd_q, cycles_q;
+  logic cpu_start_q;  // MM_START written, not yet picked up
+  // attention (attn.sv)
+  logic cpu_at_q;  // the running job is attention
+  logic cpu_at_start_q, cpu_at_mode_q;
+  logic [31:0] cpu_at_addr_q, cpu_at_cfg_q;
+  logic at_a_we_q;
+  logic [11:0] at_a_addr_q;
+  logic [31:0] at_a_data_q;
+  logic at_start, at_busy, at_done, at_b_ready, at_y_valid;
+  logic [15:0] at_y_idx;
+  logic [31:0] at_y;
+  // its DDR beats from AT_CFG (stable long before the job starts)
+  logic [11:0] at_nblk_q;
+  logic [31:0] at_beats_k_q, at_beats_v_q;
+  always_ff @(posedge clk_i) begin
+    at_nblk_q <= 12'((cpu_at_cfg_q[31:16] + 16'd15) >> 4);
+    at_beats_k_q <= 32'(at_nblk_q) * 32'(cpu_at_cfg_q[8:0]) * 2;
+    at_beats_v_q <= 32'(cpu_at_cfg_q[31:16]) * 32'(cpu_at_cfg_q[8:0]) / 8;
+  end
+  logic cons_empty, cons_full, cons_we;
+  logic [7:0] cons_data, cons_wdata;
+
   // Results wait in a FIFO for the UART
   localparam int YFifoDepth = 32;
   logic [31:0] yfifo_data;
@@ -269,7 +345,8 @@ module llm_core #(
   logic [$clog2(YFifoDepth+1)-1:0] ycredits_q;
   logic [15:0] blk_beat_q, beats_per_block_q;  // R * n / P beats per block
   logic block_ok, w_fire;
-  assign block_ok = (blk_beat_q != 0) || (ycredits_q >= R);
+  // (a CPU matmul writes its results to a RAM, which never fills)
+  assign block_ok = cpu_mm_q || (blk_beat_q != 0) || (ycredits_q >= R);
   assign w_fire = w_valid && w_ready && block_ok;
 
   fifo #(
@@ -279,7 +356,7 @@ module llm_core #(
       .clk_i  (clk_i),
       .rst_ni (rst_ni),
       .clear_i(qmv_abort),
-      .we_i   (y_valid),
+      .we_i   (y_valid && !cpu_mm_q),
       .wdata_i(y),
       .re_i   (yfifo_pop),
       .rdata_o(yfifo_data),
@@ -311,13 +388,13 @@ module llm_core #(
       .d_i(d_q),
       .busy_o(qmv_busy),
       .done_o(qmv_done),
-      .xq_we_i(xq_we),
-      .xq_addr_i(xq_addr_q),
-      .xq_data_i(rx_buf_q),
-      .xs_we_i(xs_we),
-      .xs_addr_i(xs_addr_q),
-      .xs_data_i(rx_buf_q[31-:4]),
-      .w_valid_i(w_valid && block_ok),
+      .xq_we_i(xq_we || cpu_xq_we_q),
+      .xq_addr_i(cpu_xq_we_q ? cpu_xq_addr_q : xq_addr_q),
+      .xq_data_i(cpu_xq_we_q ? cpu_xq_data_q : rx_buf_q),
+      .xs_we_i(xs_we || cpu_xs_we_q),
+      .xs_addr_i(cpu_xs_we_q ? cpu_xs_addr_q : xs_addr_q),
+      .xs_data_i(cpu_xs_we_q ? cpu_xs_data_q : rx_buf_q[31-:4]),
+      .w_valid_i(w_valid && block_ok && !cpu_at_q),
       .w_ready_o(w_ready),
       .w_q_i(w_q),
       .w_s_i(w_s),
@@ -338,6 +415,7 @@ module llm_core #(
       .clk_i(clk_i),
       .rst_ni(rst_ni),
       .start_i(rd_start),
+      .raw_i(cpu_at_q),
       .abort_i(qmv_abort),
       .base_i(addr_q),
       .axi_beats_i(rd_beats),
@@ -350,9 +428,30 @@ module llm_core #(
       .rvalid_i(c_rvalid && state_q != S_RD_DATA),
       .rready_o(rd_rready),
       .w_valid_o(w_valid),
-      .w_ready_i(w_ready && block_ok),
+      .w_ready_i(cpu_at_q ? at_b_ready : (w_ready && block_ok)),
       .w_q_o(w_q),
       .w_s_o(w_s)
+  );
+
+  attn u_attn (
+      .clk_i(clk_i),
+      .rst_ni(rst_ni),
+      .start_i(at_start),
+      .mode_i(cpu_at_mode_q),
+      .hs_i(cpu_at_cfg_q[8:0]),
+      .nt_i(cpu_at_cfg_q[31:16]),
+      .beats_i(rd_beats),
+      .busy_o(at_busy),
+      .done_o(at_done),
+      .a_we_i(at_a_we_q),
+      .a_addr_i(at_a_addr_q),
+      .a_data_i(at_a_data_q),
+      .b_valid_i(w_valid && cpu_at_q),
+      .b_ready_o(at_b_ready),
+      .b_data_i(w_q),
+      .y_valid_o(at_y_valid),
+      .y_idx_o(at_y_idx),
+      .y_o(at_y)
   );
 
   // ---------------------------------------------------------------------------
@@ -461,6 +560,10 @@ module llm_core #(
         tx_data   = yfifo_data[ybyte_q*8+:8];
         yfifo_pop = tx_valid && tx_ready && (ybyte_q == 2'd3);
       end
+      S_OP: begin  // between commands: firmware console output
+        tx_valid = !cons_empty;
+        tx_data  = cons_data;
+      end
       default: ;
     endcase
   end
@@ -490,6 +593,9 @@ module llm_core #(
       qmv_abort <= 1'b0;
       rd_start <= 1'b0;
       rd_beats <= '0;
+      cpu_mm_q <= 1'b0;
+      cpu_at_q <= 1'b0;
+      at_start <= 1'b0;
       sd_load <= 1'b0;
       sd_store <= 1'b0;
       sd_store_addr_q <= '0;
@@ -500,6 +606,7 @@ module llm_core #(
       qmv_start <= 1'b0;
       qmv_abort <= 1'b0;
       rd_start <= 1'b0;
+      at_start <= 1'b0;
       sd_load <= calib_done_i && !calib_q;  // boot: load the card image
       sd_store <= 1'b0;
 
@@ -530,6 +637,48 @@ module llm_core #(
                 end
                 default: ;  // unknown opcode: ignore the byte
               endcase
+            end else if (cpu_start_q && !sd_busy) begin
+              n_q <= cpu_nd_q[15:0];
+              d_q <= cpu_nd_q[31:16];
+              addr_q <= AddrW'(cpu_addr_q);
+              cpu_mm_q <= 1'b1;
+              byte_cnt_q <= '0;
+              state_q <= S_CPU_PREP;
+            end else if (cpu_at_start_q && !sd_busy) begin
+              addr_q <= AddrW'(cpu_at_addr_q);
+              cpu_at_q <= 1'b1;
+              byte_cnt_q <= '0;
+              state_q <= S_CPU_PREP;
+            end
+          end
+
+          S_CPU_PREP: begin  // mm_axi_beats_q is two stages behind n / d
+            byte_cnt_q <= byte_cnt_q + 1;
+            if (byte_cnt_q == 6'd3) begin
+              rd_start <= 1'b1;
+              if (cpu_at_q) begin
+                rd_beats <= cpu_at_mode_q ? at_beats_v_q : at_beats_k_q;
+                at_start <= 1'b1;
+                state_q <= S_CPU_ATT;
+              end else begin
+                rd_beats <= mm_axi_beats_q;
+                qmv_start <= 1'b1;
+                state_q <= S_CPU_RUN;
+              end
+            end
+          end
+
+          S_CPU_ATT: begin
+            if (at_done) begin
+              jobs_q <= jobs_q + 1;
+              state_q <= S_FLUSH;
+            end
+          end
+
+          S_CPU_RUN: begin
+            if (qmv_done) begin
+              jobs_q <= jobs_q + 1;
+              state_q <= S_FLUSH;
             end
           end
 
@@ -664,7 +813,11 @@ module llm_core #(
           end
 
           S_FLUSH: begin
-            if (!rd_busy && !qmv_busy) state_q <= S_OP;
+            if (!rd_busy && !qmv_busy && !at_busy) begin
+              cpu_mm_q <= 1'b0;
+              cpu_at_q <= 1'b0;
+              state_q <= S_OP;
+            end
           end
 
           default: state_q <= S_OP;
@@ -690,6 +843,150 @@ module llm_core #(
   end
 
   // ---------------------------------------------------------------------------
+  // CPU registers (AXI4-Lite), console FIFO, result RAM
+  // ---------------------------------------------------------------------------
+  localparam int YWords = 32768;
+
+  logic [6:0][31:0] xq_stage_q;  // XQ words 0..6 of the current 32-byte line
+
+  fifo #(
+      .Width(8),
+      .Depth(1024)
+  ) u_console (
+      .clk_i  (clk_i),
+      .rst_ni (rst_ni),
+      .clear_i(1'b0),
+      .we_i   (cons_we),
+      .wdata_i(cons_wdata),
+      .re_i   (state_q == S_OP && tx_fire),
+      .rdata_o(cons_data),
+      .empty_o(cons_empty),
+      .full_o (cons_full)
+  );
+
+  // result RAM
+  logic [31:0] yram[YWords];
+  logic [$clog2(YWords)-1:0] yidx_q;
+  logic [31:0] yram_rdata;
+  always_ff @(posedge clk_i) begin
+    if ((y_valid && cpu_mm_q) || at_y_valid)
+      yram[at_y_valid ? $clog2(YWords)'(at_y_idx) : yidx_q] <= at_y_valid ? at_y : y;
+    yram_rdata <= yram[s_araddr_i[$clog2(YWords)+1:2]];
+  end
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) yidx_q <= '0;
+    else if (state_q == S_CPU_PREP) yidx_q <= '0;
+    else if (y_valid && cpu_mm_q) yidx_q <= yidx_q + 1;
+  end
+
+  // ---- writes: take AW and W together, one at a time
+  logic wr_fire;
+  assign s_awready_o = s_awvalid_i && s_wvalid_i && !s_bvalid_o;
+  assign s_wready_o  = s_awready_o;
+  assign wr_fire     = s_awready_o;
+  assign cons_we     = wr_fire && (s_awaddr_i == 18'h00008);
+  assign cons_wdata  = s_wdata_i[7:0];
+
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) begin
+      s_bvalid_o <= 1'b0;
+      cpu_addr_q <= '0;
+      cpu_nd_q <= '0;
+      cpu_start_q <= 1'b0;
+      cpu_xq_we_q <= 1'b0;
+      cpu_xs_we_q <= 1'b0;
+      cycles_q <= '0;
+      cpu_at_start_q <= 1'b0;
+      cpu_at_mode_q <= 1'b0;
+      cpu_at_addr_q <= '0;
+      cpu_at_cfg_q <= '0;
+      at_a_we_q <= 1'b0;
+    end else begin
+      cycles_q <= cycles_q + 1;
+      cpu_xq_we_q <= 1'b0;
+      cpu_xs_we_q <= 1'b0;
+      at_a_we_q <= 1'b0;
+      if (wr_fire) s_bvalid_o <= 1'b1;
+      else if (s_bready_i) s_bvalid_o <= 1'b0;
+      if (state_q == S_OP && !rx_valid && cpu_start_q && !sd_busy) cpu_start_q <= 1'b0;
+      if (state_q == S_OP && !rx_valid && !cpu_start_q && cpu_at_start_q && !sd_busy)
+        cpu_at_start_q <= 1'b0;
+
+      if (wr_fire) begin
+        if (s_awaddr_i == 18'h00010) cpu_addr_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00014) cpu_nd_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00018) cpu_start_q <= 1'b1;
+        if (s_awaddr_i == 18'h00030) cpu_at_addr_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00034) cpu_at_cfg_q <= s_wdata_i;
+        if (s_awaddr_i == 18'h00038) begin
+          cpu_at_start_q <= 1'b1;
+          cpu_at_mode_q <= s_wdata_i[0];
+        end
+        if (s_awaddr_i[17:14] == 4'b0001) begin  // 0x04000..0x07FFF: AT_A
+          at_a_we_q <= 1'b1;
+          at_a_addr_q <= s_awaddr_i[13:2];
+          at_a_data_q <= s_wdata_i;
+        end
+        if (s_awaddr_i[17:11] == 7'b0000_010) begin  // 0x01000..0x017FF: XQ
+          if (s_awaddr_i[4:2] == 3'd7) begin
+            cpu_xq_we_q <= 1'b1;
+            cpu_xq_addr_q <= ($clog2(MaxN/P))'(s_awaddr_i[10:5]);
+            cpu_xq_data_q <= {s_wdata_i, xq_stage_q};
+          end else begin
+            xq_stage_q[s_awaddr_i[4:2]] <= s_wdata_i;
+          end
+        end
+        if (s_awaddr_i[17:8] == 10'b00_0001_1000) begin  // 0x01800..0x018FF: XS
+          cpu_xs_we_q <= 1'b1;
+          cpu_xs_addr_q <= ($clog2(MaxN/GS))'(s_awaddr_i[7:2]);
+          cpu_xs_data_q <= s_wdata_i;
+        end
+      end
+    end
+  end
+
+  // ---- reads: one at a time, data the cycle after the address (Y RAM read)
+  logic rd_pend_q;
+  logic [17:0] raddr_q;
+  assign s_arready_o = !rd_pend_q && !s_rvalid_o;
+
+  always_ff @(posedge clk_i, negedge rst_ni) begin
+    if (~rst_ni) begin
+      rd_pend_q <= 1'b0;
+      s_rvalid_o <= 1'b0;
+    end else begin
+      if (s_arvalid_i && s_arready_o) begin
+        rd_pend_q <= 1'b1;
+        raddr_q <= s_araddr_i;
+      end
+      if (rd_pend_q) begin
+        rd_pend_q <= 1'b0;
+        s_rvalid_o <= 1'b1;
+        if (raddr_q[17]) s_rdata_o <= yram_rdata;
+        else begin
+          case (raddr_q)
+            18'h00000: s_rdata_o <= 32'h314D_4C4C;  // "LLM1"
+            18'h00004:
+            s_rdata_o <= {22'd0, cons_full, cpu_start_q || cpu_mm_q || cpu_at_start_q || cpu_at_q,
+                          sd_err_code, sd_err, sd_ok,
+                          sd_busy, calib_done_i};
+            18'h00010: s_rdata_o <= cpu_addr_q;
+            18'h00014: s_rdata_o <= cpu_nd_q;
+            18'h0001C: s_rdata_o <= sd_img_bytes;
+            18'h00020: s_rdata_o <= sd_img_addr;
+            18'h00024: s_rdata_o <= cycles_q;
+            18'h00030: s_rdata_o <= cpu_at_addr_q;
+            18'h00034: s_rdata_o <= cpu_at_cfg_q;
+            default:   s_rdata_o <= 32'd0;
+          endcase
+        end
+      end else if (s_rvalid_o && s_rready_i) begin
+        s_rvalid_o <= 1'b0;
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------------
   // LEDs: 0 heartbeat, 1 DDR calibrated, 2 matmul running,
   //       3 SD: blinks while busy, on when an image loaded / stored fine,
   //       7:4 SD error code after an SD error, else completed matmuls (mod 16)
@@ -704,7 +1001,7 @@ module llm_core #(
   always_ff @(posedge clk_i) begin
     led_o[0]   <= heartbeat_q[26];
     led_o[1]   <= calib_done_i;
-    led_o[2]   <= (state_q == S_MM_RUN);
+    led_o[2]   <= (state_q == S_MM_RUN) || (state_q == S_CPU_RUN) || (state_q == S_CPU_ATT);
     led_o[3]   <= sd_busy ? heartbeat_q[23] : sd_ok;
     led_o[7:4] <= sd_err ? sd_err_code : jobs_q;
   end
