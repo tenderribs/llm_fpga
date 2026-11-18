@@ -297,7 +297,8 @@ about 3 ms. Without the engine and attention unit, the MicroBlaze V alone
 would manage about 1 token/s (from bring-up's 288x288 matmul on the CPU).
 Power wasn't measured.
 
-How the board's speed developed (same model and prompt):
+How the board's speed developed (same model and prompt, a fixed 256 tokens,
+so a little slower than the 168-token story above; the first row: 64):
 
 | Step | tokens/s |
 |---|---|
@@ -306,7 +307,7 @@ How the board's speed developed (same model and prompt):
 | Hot buffers in local memory; attention loops overlapped | 7.3 |
 | 5-stage CPU pipeline, 32 KB write-back data cache | 11.3 |
 | fp32 attention unit | 19.7 |
-| Results over the local memory bus, argmax in hardware | 32 |
+| Results over the local memory bus, argmax in hardware | 27.5 |
 
 ## Status and next steps
 
