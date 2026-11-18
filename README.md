@@ -27,6 +27,14 @@ firmware's, is bit-identical to llama2.c's `runq.c`.
 
 ## Architecture
 
+**[docs/system_design.md](docs/system_design.md)** describes the system as a
+whole: hardware / software split, clocks and crossings, memories, the job
+model, numerics, boot, verification, the time budget and its limits, and
+resources. Its diagrams: [clocks](docs/diagrams/clocks.drawio.svg),
+[time per token](docs/diagrams/budget.drawio.svg),
+[boot](docs/diagrams/boot.drawio.svg),
+[verification](docs/diagrams/verification.drawio.svg).
+
 ![System overview: host PC, the FPGA's CPU subsystem and llm_core, the DDR3 controller, DDR3 and the microSD card](docs/diagrams/system.drawio.svg)
 
 The diagrams in `docs/diagrams/` are `.drawio.svg` files: GitHub shows them as
@@ -330,8 +338,10 @@ KV cache writes), and ~1.8 ms on the CPU (RMSNorm 0.6, RoPE 0.4, starting
 jobs and moving vectors). Without the accelerators, the MicroBlaze V alone
 would manage about 1 token/s. Power wasn't measured.
 
-How the board's speed developed (same model and prompt, a fixed 256 tokens,
-so a little slower than the 168-token story above; the first row: 64):
+How the board's speed developed (same model and prompt, a fixed 256 tokens
+with `--trace`; the first row: 64). Tracing copies all 32,000 logits out of
+the result RAM every token (~1.3 ms) and the KV cache gets longer, so these
+are slower than the 168-token story above:
 
 | Step | tokens/s |
 |---|---|
@@ -350,13 +360,18 @@ so a little slower than the 168-token story above; the first row: 64):
 ## Status and next steps
 
 Measured on the board (stories15M, greedy, `host/chat.py`): about 165
-tokens/s for a full story (the time per token above).
+tokens/s for a full story (the time per token above). Streaming the
+weights from DDR3 alone takes ~2.5 ms per token, so this board tops out
+around 400 tokens/s with bit-exact int8 weights; what is left is estimated
+at ~1.5x for considerable RTL work (see
+[docs/system_design.md](docs/system_design.md#9-performance-and-what-limits-it)).
 
 - [ ] Power-on boot from the QSPI flash (needs a power cycle on site; the
       mode jumper must be on QSPI)
-- [ ] RMSNorm and RoPE on the vector unit, so a layer runs without the CPU
-      touching the data
 - [ ] Bigger models: stories42M, stories110M (the microSD card has room)
+- [ ] Optional speed-ups: RMSNorm and RoPE on the vector unit (~200
+      tokens/s), a hardware job list per layer (~230-250)
+- [ ] Measure power
 
 `top_qmv` and `top_gemm` have their own host scripts: `host/qmv_uart.py`,
 `host/gemm_uart.py`.

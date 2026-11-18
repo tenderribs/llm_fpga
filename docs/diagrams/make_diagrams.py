@@ -524,8 +524,280 @@ def memory():
     d.write()
 
 
+# =============================================================================
+# 5. Clocks, resets and the clock-domain crossings
+# =============================================================================
+def clocks():
+    d = Diagram("clocks", 1240, 640)
+    d.text("t", 20, 12, 1200, 24, "Clocks, resets and where data crosses between clock domains",
+           size=13, bold=True, bg=False)
+    d.box("osc", 20, 85, 170, 60, ["Board oscillator", "200 MHz, differential"], color="gray")
+    d.box("btn", 20, 290, 170, 60, ["CPU RESET button", "resets the whole design"],
+          color="gray")
+    d.box("mig", 230, 80, 280, 110, ["DDR3 controller (MIG)", "PLL: 900 MHz memory clock",
+                                     "(1800 MT/s), 4:1 -> ui_clk 225 MHz;",
+                                     "reset held until calibrated"], color="blue")
+    d.box("ddr", 240, 235, 200, 55, ["DDR3 SDRAM", "32 bits wide, 7.2 GB/s peak"],
+          color="blue")
+
+    d.group("g225", 560, 50, 660, 210, "225 MHz domain (ui_clk)", color="green",
+            subtitle="timing closes with +0.008 ns of slack")
+    d.box("core", 580, 100, 280, 120, ["llm_core", "matmul engine, attention unit,",
+                                       "vector unit, weight reader, DMA,",
+                                       "registers, UART, microSD"], color="green")
+    d.box("io", 900, 100, 300, 70, ["Slow I/O, divided from ui_clk", "UART 3 Mbaud (75 clocks per bit)",
+                                    "microSD SPI 400 kHz, then 22.5 MHz"], color="gray")
+
+    d.box("sc", 580, 290, 280, 70, ["SmartConnect (crossing)", "clock converters: CPU -> DDR3,",
+                                    "CPU -> registers (AXI4-Lite)"], color="red")
+    d.box("yv", 900, 290, 300, 70, ["Y and V RAMs (crossing)", "dual-port block RAM: port A 225 MHz",
+                                    "(units), port B 150 MHz (CPU's LMB)"], color="red")
+
+    d.group("g150", 560, 390, 660, 150, "150 MHz domain (CPU)", color="purple",
+            subtitle="block design, scripts/gen_cpu.tcl")
+    d.box("cw", 580, 440, 280, 85, ["Clocking wizard (MMCM)", "ui_clk 225 -> 150 MHz;",
+                                    "proc_sys_reset"], color="purple")
+    d.box("mbv", 900, 440, 300, 85, ["MicroBlaze V", "pipeline, FPU, caches,",
+                                     "256 KB local memory, debug module"], color="purple")
+
+    d.edge("osc", "mig", exit=(1, 0.5), entry=(0, 105 / 110 * 0 + 0.3))
+    d.edge("btn", "mig", exit=(1, 0.3), entry=(0, 0.8), points=[(210, 308), (210, 168)],
+           label="sys_rst", label_at=(210, 240), label_w=48)
+    d.edge("mig", "ddr", exit=(0.2, 1), entry=(0.3, 0), both=True)
+    d.edge("mig", "core", exit=(1, 50 / 110), entry=(0, 30 / 120),
+           label=["ui_clk,", "reset"], label_at=(538, 130), label_w=44)
+    d.edge("mig", "cw", exit=(1, 0.85), entry=(0, 0.5), points=[(530, 173.5), (530, 482.5)],
+           label="ui_clk", label_at=(530, 420), label_w=44)
+    d.edge("sc", "mig", exit=(0, 0.3), entry=(250 / 280, 1), points=[(480, 311)],
+           label=["AXI4 256-bit", "225 MHz"], label_at=(480, 250), label_w=80)
+    d.edge("core", "sc", exit=(0.5, 1), entry=(0.5, 0), both=True,
+           label="DDR3 traffic, registers", label_at=(720, 255), label_w=140)
+    d.edge("core", "yv", exit=(1, 0.85), entry=(100 / 300, 0), points=[(1000, 202)],
+           label="results", label_at=(1000, 240), label_w=52)
+    d.edge("core", "io", exit=(1, 0.2), entry=(0, 24 / 70))
+    d.edge("cw", "mbv", exit=(1, 0.5), entry=(0, 0.5), label="150 MHz",
+           label_at=(880, 470), label_w=52)
+    d.edge("sc", "mbv", exit=(0.85, 1), entry=(30 / 300, 0), points=[(818, 410), (930, 410)],
+           both=True)
+    d.edge("yv", "mbv", exit=(0.5, 1), entry=(0.5, 0), both=True, label="LMB",
+           label_at=(1050, 400), label_w=34)
+    d.text("note", 20, 555, 1200, 75,
+           ["Everything that touches DDR3 runs on the memory controller's own 225 MHz clock, so the "
+            "256-bit data path (weights, K / V, DMA) never crosses a clock domain.",
+            "The CPU runs at 150 MHz because the MicroBlaze V's pipeline does not close at 225 MHz. "
+            "Only two places cross: the SmartConnect (handshaked clock converters) and the",
+            "dual-port Y / V RAMs. The RAMs need no handshake: the CPU reads a job's results only after "
+            "it has seen the job's busy flag drop through the (slower) register path.",
+            "The reset button resets the DDR3 controller; its synchronized reset then resets llm_core "
+            "and, through the clocking wizard and proc_sys_reset, the CPU."],
+           size=11, bg=False, align="left")
+    d.write()
+
+
+# =============================================================================
+# 6. Where a token's time goes, and the DDR3 floor
+# =============================================================================
+def budget():
+    d = Diagram("budget", 1240, 600)
+    d.text("t", 20, 12, 1200, 24,
+           "One token: 6.1 ms (165 tokens/s), stories15M, 168-token story, measured on the board "
+           "by the firmware's cycle counter", size=13, bold=True, bg=False)
+    x0, scale = 160, 170.0  # px per ms
+
+    def bar(prefix, y, segs, h=56):
+        x = x0
+        for i, (ms, lines, col) in enumerate(segs):
+            w = ms * scale
+            if w >= 45:
+                d.box(f"{prefix}{i}", x, y, w, h, lines, color=col, size=11 if w >= 90 else 10,
+                      rounded=False)
+            else:
+                d.box(f"{prefix}{i}", x, y, w, h, [""], color=col, size=11, rounded=False)
+                d.text(f"{prefix}{i}t", x - 25 + w / 2, y + h + 4, 70, 30, lines, size=10,
+                       bg=False)
+            x += w
+        return x
+
+    d.text("l1", 20, 75, 135, 40, ["Now (measured)"], size=11, bold=True, bg=False, align="left")
+    bar("a", 70, [
+        (3.1, ["Matmuls 3.1", "engine, streaming 17.1 MB", "of weights from DDR3"], "green"),
+        (0.84, ["Attention 0.84", "scores, softmax,", "weighted sums"], "orange"),
+        (0.36, ["KV", "store 0.36"], "orange"),
+        (0.6, ["RMSNorm", "0.6 (CPU)"], "purple"),
+        (0.4, ["RoPE", "0.4 (CPU)"], "purple"),
+        (0.3, ["Quant.", "0.3"], "yellow"),
+        (0.1, ["SwiGLU", "0.1"], "yellow"),
+        (0.3, ["Other", "0.3"], "gray"),
+    ])
+    # classifier share of the matmuls
+    cx1 = x0 + 1.22 * scale
+    cx2 = x0 + 3.1 * scale
+    d.box("cls", cx1, 160, cx2 - cx1, 26, ["classifier ~1.9 ms (10.4 of the 17.1 MB)"],
+          color="white", size=10, title_bold=False, rounded=False)
+    d.box("lay", x0, 160, cx1 - x0, 26, ["6 layers ~1.2 ms"], color="white", size=10,
+          title_bold=False, rounded=False)
+
+    d.text("l2", 20, 235, 135, 40, ["DDR3 floor"], size=11, bold=True, bg=False, align="left")
+    d.box("floor", x0, 230, 2.7 * scale, 56, ["~2.4-2.7 ms", "17.1 MB at 6.4-7.2 GB/s"],
+          color="blue", size=11, rounded=False)
+    d.text("fl", x0 + 2.7 * scale + 10, 230, 560, 56,
+           ["if nothing but the weight streaming were left: ~370-420 tokens/s,",
+            "the ceiling for this board with bit-exact int8 weights"], size=11, bg=False,
+           align="left")
+
+    d.text("l3", 20, 315, 135, 40, ["Estimates of", "what is left"], size=11, bold=True,
+           bg=False, align="left")
+    d.box("e1", x0, 310, 5.0 * scale, 40, ["RMSNorm and RoPE on the vector unit: ~5.0 ms, ~200 tokens/s"],
+          color="white", size=11, title_bold=False, rounded=False, dashed=True)
+    d.box("e2", x0, 360, 4.2 * scale, 40, ["+ a hardware job list per layer: ~4.0-4.3 ms, ~230-250 tokens/s"],
+          color="white", size=11, title_bold=False, rounded=False, dashed=True)
+
+    # scale
+    for ms in range(0, 7):
+        x = x0 + ms * scale
+        d.text(f"s{ms}", x - 20, 412, 40, 16, f"{ms} ms", size=10, bg=False)
+
+    d.text("data", 20, 450, 1200, 140,
+           ["Data moved per token:",
+            "- weights: 17.1 MB (15.2 M int8 + one float32 scale per 32), every token; the matmuls "
+            "run at 5.5 GB/s effective, 77 % of the DDR3 peak",
+            "- KV cache reads: ~1.7 MB on average over the story (3.5 MB at position 255); writes: "
+            "13.8 KB",
+            "- about 300 hardware jobs (43 matmuls, 144 attention / softmax / copy, 72 KV DMA, 31 "
+            "quantize / SwiGLU), each started and polled by the CPU over AXI4-Lite",
+            "Every step waits for the one before it (the forward pass is a dependency chain), so the "
+            "parts add up. Even with the CPU's work and all control at zero, the weights alone "
+            "take ~2.5 ms."],
+           size=11, bg=False, align="left")
+    d.write()
+
+
+# =============================================================================
+# 7. Boot and a prompt
+# =============================================================================
+def boot():
+    d = Diagram("boot", 1240, 560)
+    d.text("t", 20, 12, 1200, 24, "Power-on to a story: who does what, in order (left to right)",
+           size=13, bold=True, bg=False)
+    lanes = [("Host PC", "gray", 60), ("FPGA, DDR3", "blue", 160), ("llm_core", "green", 260),
+             ("CPU firmware", "purple", 360)]
+    for i, (name, col, y) in enumerate(lanes):
+        d.box(f"lane{i}", 20, y, 1200, 85, [""], color="none", rounded=False, dashed=True)
+        d.box(f"ln{i}", 30, y + 12, 110, 60, [name], color=col)
+
+    y0, y1, y2, y3 = 72, 172, 272, 372
+    h = 62
+    d.box("cfg", 170, y1, 180, h, ["Configure from QSPI", "x4 SPI, 33 MHz, compressed;",
+                                   "firmware is in the bitstream"], color="blue", size=11)
+    d.box("cal", 380, y1, 170, h, ["DDR3 calibration", "then the 225 MHz resets", "release"],
+          color="blue", size=11)
+    d.box("sd", 590, y2, 250, h, ["SD_LOAD, by itself", "card init, model image -> DDR3",
+                                  "offset 0, checksum: ~7 s"], color="green", size=11)
+    d.box("poll", 590, y3, 250, h, ["Starts from local memory", "prints a banner, polls STATUS:",
+                                    "calibrated, SD_OK (or SD_ERR)"], color="purple", size=11)
+    d.box("open", 870, y3, 160, h, ["Open the model", "check the header, tokenizer,",
+                                    "RMSNorm -> local memory"], color="purple", size=10)
+    d.box("gen", 1050, y3, 160, h, ["generate()", "forward() per token:", "~300 jobs each"],
+          color="purple", size=11)
+    d.box("chat", 870, y0, 160, h, ["host/chat.py", "waits for READY,", "sends a prompt line"],
+          color="gray", size=11)
+    d.box("out", 1050, y0, 160, h, ["Story text", "as it is generated;", "LLM DONE, READY"],
+          color="gray", size=11)
+    d.box("jobs", 1050, y2, 160, h, ["Hardware jobs", "matmul, attention,", "vector unit, DMA"],
+          color="green", size=11)
+
+    d.edge("cfg", "cal")
+    d.edge("cal", "sd", exit=(1, 0.5), entry=(0, 0.3), points=[(570, 203), (570, 290.6)])
+    d.edge("cfg", "poll", exit=(0.5, 1), entry=(0, 0.5), points=[(260, 403)],
+           label="CPU starts at once", label_at=(390, 403), label_w=110)
+    d.edge("sd", "poll", exit=(0.5, 1), entry=(0.5, 0), label="STATUS",
+           label_at=(715, 353), label_w=46)
+    d.edge("poll", "open")
+    d.edge("open", "chat", exit=(0.5, 0), entry=(0.5, 1), dashed=True,
+           label="READY (console)", label_at=(950, 250), label_w=100)
+    d.edge("chat", "gen", exit=(1, 0.75), entry=(0.2, 0), points=[(1040, 118.5), (1040, 345),
+                                                                  (1082, 345)],
+           label=["prompt:", "CONSOLE_IN"], label_at=(1040, 170), label_w=72)
+    d.edge("gen", "jobs", exit=(0.7, 0), entry=(0.7, 1), both=True)
+    d.edge("gen", "out", exit=(0.9, 0), entry=(0.9, 1), points=[], dashed=True)
+    d.text("txt", 1180, 230, 40, 16, "text", size=10)
+    d.text("note", 20, 460, 1200, 90,
+           ["The FPGA boots by itself from the QSPI flash (mode jumper on QSPI); "
+            "make TOP=top_soc program_fw loads the same design over JTAG instead.",
+            "The model image gets onto the microSD card once: host/image_tool.py upload --store "
+            "(UART -> DDR3, then SD_STORE writes it to the card, header last).",
+            "The CPU polls rather than waits for an interrupt; after READY it blocks on the console "
+            "until a line arrives. /steps N and /trace PROMPT are the other commands."],
+           size=11, bg=False, align="left")
+    d.write()
+
+
+# =============================================================================
+# 8. Verification: the chain of bit-exact goldens
+# =============================================================================
+def verify():
+    d = Diagram("verification", 1240, 560)
+    d.text("t", 20, 12, 1200, 24,
+           "Verification: every link is checked bit for bit, from llama2.c to the board",
+           size=13, bold=True, bg=False)
+    d.text("h1", 20, 45, 600, 20, "Whole model (every step's token and logits)", size=12,
+           bold=True, bg=False, align="left")
+    d.box("runq", 20, 80, 230, 90, ["llama2.c runq.c", "ref/runq_dump (x86, libm):",
+                                    "logits of every step, the 43", "matmuls at one position"],
+          color="gray", size=11)
+    d.box("glibm", 330, 80, 250, 90, ["fw/model on x86, libm", "fw/build/golden_libm:",
+                                      "runq.c's forward(), same float", "ops in the same order"],
+          color="purple", size=11)
+    d.box("gold", 660, 80, 250, 90, ["fw/model on x86, mathf.c", "fw/build/golden: own expf /",
+                                     "sincosf, same bits on x86", "and on the board's FPU"],
+          color="purple", size=11)
+    d.box("board", 990, 80, 230, 90, ["The board", "fw/llm + the hardware units;",
+                                      "host/chat.py --trace:", "T pos token logits-hash"],
+          color="green", size=11)
+    d.edge("runq", "glibm", label="identical", label_at=(290, 110), label_w=60)
+    d.edge("glibm", "gold", label=["same code,", "own math"], label_at=(620, 125), label_w=66)
+    d.edge("gold", "board", label="identical", label_at=(950, 110), label_w=60)
+    d.text("n1", 20, 180, 1200, 40,
+           ["Compiled without FMA contraction (-ffp-contract=off). The board's 256-step trace "
+            "matches fw/build/golden line for line; any changed bit in any logit changes the hash."],
+           size=11, bg=False, align="left")
+
+    d.text("h2", 20, 235, 600, 20, "Each unit (Verilator, sim/run_*.sh)", size=12, bold=True,
+           bg=False, align="left")
+    d.box("ref", 20, 270, 230, 160, ["References (Python)", "ref/q80.py: Q8_0 matmul,",
+                                     "quantize (bit-exact)", "sim/fp_ref.py: m_expf port",
+                                     "sim/gen_*.py: vectors,", "numpy float32"],
+          color="gray", size=11)
+    tbs = [
+        ("tb_fp32", ["tb_fp32", "add, mul, convert, divide, exp:", "100k vectors, rounding ties"]),
+        ("tb_qmv", ["tb_qmv", "real runq.c matmuls incl. the", "32000-row classifier, stalls"]),
+        ("tb_attn", ["tb_attn", "scores and weighted sums:", "head sizes 8-64, 1 and 2 K blocks"]),
+        ("tb_vpu", ["tb_vpu", "QUANT, SILU, SOFTMAX, COPY", "against the firmware's math"]),
+        ("tb_core", ["tb_llm_core", "all commands and CPU jobs; AXI", "memory and SD card models"]),
+        ("tb_top", ["tb_top_qmv, tb_sd_ctrl", "through the UART pins;", "SDHC and SDSC cards"]),
+    ]
+    for i, (id_, lines) in enumerate(tbs):
+        x = 330 + (i % 3) * 300
+        y = 270 + (i // 3) * 90
+        d.box(id_, x, y, 270, 70, lines, color="green", size=11)
+    d.edge("ref", "tb_fp32", exit=(1, 35 / 160), entry=(0, 0.5), label="vectors",
+           label_at=(290, 290), label_w=50)
+    d.edge("ref", "tb_vpu", exit=(1, 125 / 160), entry=(0, 0.5))
+    d.text("n2", 20, 450, 1200, 90,
+           ["Every result is compared bit for bit (no tolerances). The float units round to "
+            "nearest even like the CPU and flush subnormals, a range these values never reach.",
+            "On the board, fw/build/bringup.elf checks the CPU, FPU, DDR3 and one engine matmul "
+            "against the CPU; the whole-model trace above checks everything else."],
+           size=11, bg=False, align="left")
+    d.write()
+
+
 if __name__ == "__main__":
     system()
     core()
     token()
     memory()
+    clocks()
+    budget()
+    boot()
+    verify()
