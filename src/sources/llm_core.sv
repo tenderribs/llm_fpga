@@ -492,8 +492,11 @@ module llm_core #(
   logic [7:0] rd_arlen;
   logic rd_arvalid, rd_rready;
 
+  // a deep FIFO keeps up to 8 bursts in flight, for the DDR controller to
+  // schedule (2 were too few to reach its read bandwidth)
   wstream_reader #(
-      .AddrW(AddrW)
+      .AddrW(AddrW),
+      .FifoDepth(512)
   ) u_reader (
       .clk_i(clk_i),
       .rst_ni(rst_ni),

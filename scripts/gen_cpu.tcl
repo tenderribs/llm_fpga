@@ -55,7 +55,7 @@ set s_ext [create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:aximm_rtl:
 set_property -dict [list CONFIG.PROTOCOL AXI4 CONFIG.DATA_WIDTH 256 CONFIG.ADDR_WIDTH 32 \
     CONFIG.ID_WIDTH 0 CONFIG.HAS_LOCK 0 CONFIG.HAS_CACHE 0 CONFIG.HAS_PROT 0 CONFIG.HAS_QOS 0 \
     CONFIG.HAS_REGION 0 CONFIG.HAS_WSTRB 1 CONFIG.HAS_BRESP 1 CONFIG.HAS_RRESP 1 \
-    CONFIG.NUM_READ_OUTSTANDING 4 CONFIG.NUM_WRITE_OUTSTANDING 16 \
+    CONFIG.NUM_READ_OUTSTANDING 8 CONFIG.NUM_WRITE_OUTSTANDING 16 \
     CONFIG.FREQ_HZ $clk_hz] $s_ext
 
 set m_ddr [create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_DDR]
