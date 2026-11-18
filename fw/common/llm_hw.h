@@ -24,6 +24,17 @@
 #define LLM_AT_CFG      REG(0x00034)   // head_size | timesteps << 16
 #define LLM_AT_START    REG(0x00038)   // 0: scores, 1: weighted sum
 #define LLM_ARGMAX      REG(0x0003C)   // largest result of the last CPU matmul
+#define LLM_MM_YOFF     REG(0x00044)   // where a CPU matmul's results start in Y
+#define LLM_VPU_OP      REG(0x00050)   // start a vector unit job (VPU_*)
+#define LLM_VPU_N       REG(0x00054)
+#define LLM_VPU_SRC     REG(0x00058)
+#define LLM_VPU_SRC2    REG(0x0005C)
+#define LLM_VPU_DST     REG(0x00060)
+#define LLM_VPU_F       REG(0x00064)
+#define VPU_QUANT       1u
+#define VPU_SILU        2u
+#define VPU_SOFTMAX     3u
+#define VPU_SRC_V       (1u << 8)     // QUANT reads the V RAM
 #define LLM_XQ          ((volatile uint32_t *)(LLM_BASE + 0x01000))
 #define LLM_XS          ((volatile uint32_t *)(LLM_BASE + 0x01800))
 #define LLM_AT_A        ((volatile uint32_t *)(LLM_BASE + 0x04000))
@@ -31,6 +42,8 @@
 // the same Y RAM on the local memory bus: a few cycles per read instead of
 // a round trip through the interconnect
 #define LLM_YL          ((const volatile uint32_t *)0x00100000u)
+// the vector unit's V RAM (4096 words), read / write on the local memory bus
+#define LLM_VL          ((volatile uint32_t *)0x00120000u)
 
 #define ST_CALIB        (1u << 0)
 #define ST_SD_BUSY      (1u << 1)

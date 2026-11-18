@@ -247,6 +247,59 @@ __attribute__((weak)) void att_wsum(RunState *s, const Config *p, int l, int kvh
     }
 }
 
+// ---- the matmuls' input and the vector work between matmuls: the CPU
+// defaults (weak), which a platform can do elsewhere with the same results
+
+// quantize x (n floats) into qx for the next qmatmul()s
+__attribute__((weak)) void mm_quant(QTensor *qx, const float *x, int n, int gs) {
+    quantize(qx, x, n, gs);
+}
+
+// one head's attention: xb[h] from q[h] and the KV cache of layer l
+__attribute__((weak)) void att_head(RunState *s, const Config *p, int l, int h, int kvh, int pos,
+                                    float sqrt_hs) {
+    int head_size = p->dim / p->n_heads;
+    float *att = s->att + h * p->seq_len;
+    att_scores(s, p, l, kvh, s->q + h * head_size, att, pos + 1);
+    div4(att, pos + 1, sqrt_hs);
+    softmax(att, pos + 1);
+    att_wsum(s, p, l, kvh, att, s->xb + h * head_size, pos + 1);
+}
+
+// the FFN up to w2: w1 and w3 matmuls of s->xq, SwiGLU, quantized into s->hq
+__attribute__((weak)) void ffn_hidden(const Model *m, RunState *s, int l) {
+    int dim = m->c.dim, hidden_dim = m->c.hidden_dim, gs = m->c.gs;
+    PROF(PROF_MM, qmatmul(s->hb, &s->xq, model_mat(m, l, MAT_W1), dim, hidden_dim));
+    PROF(PROF_MM, qmatmul(s->hb2, &s->xq, model_mat(m, l, MAT_W3), dim, hidden_dim));
+
+    // SwiGLU
+    {
+    PROF_BEGIN();
+    int i = 0;
+    for (; i + 4 <= hidden_dim; i += 4) {
+        float nv[4] = {-s->hb[i], -s->hb[i + 1], -s->hb[i + 2], -s->hb[i + 3]}, e[4];
+        EXPF4(nv, e);
+        float d0 = 1.0f / (1.0f + e[0]), d1 = 1.0f / (1.0f + e[1]);
+        float d2 = 1.0f / (1.0f + e[2]), d3 = 1.0f / (1.0f + e[3]);
+        float v0 = s->hb[i] * d0, v1 = s->hb[i + 1] * d1;
+        float v2 = s->hb[i + 2] * d2, v3 = s->hb[i + 3] * d3;
+        s->hb[i] = v0 * s->hb2[i];
+        s->hb[i + 1] = v1 * s->hb2[i + 1];
+        s->hb[i + 2] = v2 * s->hb2[i + 2];
+        s->hb[i + 3] = v3 * s->hb2[i + 3];
+    }
+    for (; i < hidden_dim; i++) {
+        float val = s->hb[i];
+        val *= (1.0f / (1.0f + EXPF(-val)));
+        val *= s->hb2[i];
+        s->hb[i] = val;
+    }
+    PROF_END(PROF_FFN);
+    }
+
+    PROF(PROF_QUANT, quantize(&s->hq, s->hb, hidden_dim, gs));
+}
+
 float *forward(const Model *m, RunState *s, int token, int pos) {
     const Config *p = &m->c;
     float *x = s->x;
@@ -271,7 +324,7 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
     for (int l = 0; l < p->n_layers; l++) {
         PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_att + l * dim, dim));
 
-        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
+        PROF(PROF_QUANT, mm_quant(&s->xq, s->xb, dim, gs));
         PROF(PROF_MM, qmatmul(s->q, &s->xq, model_mat(m, l, MAT_WQ), dim, dim));
         PROF(PROF_MM, qmatmul(s->k, &s->xq, model_mat(m, l, MAT_WK), dim, kv_dim));
         PROF(PROF_MM, qmatmul(s->v, &s->xq, model_mat(m, l, MAT_WV), dim, kv_dim));
@@ -298,58 +351,24 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         PROF_BEGIN();
         att_store_kv(s, p, l, pos);
         float sqrt_hs = sqrtf(head_size);
-        for (int h = 0; h < p->n_heads; h++) {
-            float *att = s->att + h * p->seq_len;
-            att_scores(s, p, l, h / kv_mul, s->q + h * head_size, att, pos + 1);
-            div4(att, pos + 1, sqrt_hs);
-            softmax(att, pos + 1);
-            att_wsum(s, p, l, h / kv_mul, att, s->xb + h * head_size, pos + 1);
-        }
+        for (int h = 0; h < p->n_heads; h++) att_head(s, p, l, h, h / kv_mul, pos, sqrt_hs);
         PROF_END(PROF_ATT);
         }
 
-        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
+        PROF(PROF_QUANT, mm_quant(&s->xq, s->xb, dim, gs));
         PROF(PROF_MM, qmatmul(s->xb2, &s->xq, model_mat(m, l, MAT_WO), dim, dim));
         for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
 
         PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_ffn + l * dim, dim));
 
-        PROF(PROF_QUANT, quantize(&s->xq, s->xb, dim, gs));
-        PROF(PROF_MM, qmatmul(s->hb, &s->xq, model_mat(m, l, MAT_W1), dim, hidden_dim));
-        PROF(PROF_MM, qmatmul(s->hb2, &s->xq, model_mat(m, l, MAT_W3), dim, hidden_dim));
-
-        // SwiGLU
-        {
-        PROF_BEGIN();
-        int i = 0;
-        for (; i + 4 <= hidden_dim; i += 4) {
-            float nv[4] = {-s->hb[i], -s->hb[i + 1], -s->hb[i + 2], -s->hb[i + 3]}, e[4];
-            EXPF4(nv, e);
-            float d0 = 1.0f / (1.0f + e[0]), d1 = 1.0f / (1.0f + e[1]);
-            float d2 = 1.0f / (1.0f + e[2]), d3 = 1.0f / (1.0f + e[3]);
-            float v0 = s->hb[i] * d0, v1 = s->hb[i + 1] * d1;
-            float v2 = s->hb[i + 2] * d2, v3 = s->hb[i + 3] * d3;
-            s->hb[i] = v0 * s->hb2[i];
-            s->hb[i + 1] = v1 * s->hb2[i + 1];
-            s->hb[i + 2] = v2 * s->hb2[i + 2];
-            s->hb[i + 3] = v3 * s->hb2[i + 3];
-        }
-        for (; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            val *= (1.0f / (1.0f + EXPF(-val)));
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
-        PROF_END(PROF_FFN);
-        }
-
-        PROF(PROF_QUANT, quantize(&s->hq, s->hb, hidden_dim, gs));
+        PROF(PROF_QUANT, mm_quant(&s->xq, s->xb, dim, gs));
+        ffn_hidden(m, s, l);
         PROF(PROF_MM, qmatmul(s->xb, &s->hq, model_mat(m, l, MAT_W2), hidden_dim, dim));
         for (int i = 0; i < dim; i++) x[i] += s->xb[i];
     }
 
     PROF(PROF_NORM, rmsnorm(x, x, m->rms_final, dim));
-    PROF(PROF_QUANT, quantize(&s->xq, x, dim, gs));
+    PROF(PROF_QUANT, mm_quant(&s->xq, x, dim, gs));
     PROF(PROF_MM, qmatmul(s->logits, &s->xq, model_mat(m, p->n_layers, 0), dim, p->vocab_size));
     return s->logits;
 }

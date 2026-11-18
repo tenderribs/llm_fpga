@@ -76,3 +76,10 @@ void att_wsum(RunState *s, const Config *p, int l, int kvh, const float *att, fl
     uint32_t *xw = (uint32_t *)xb;
     for (int i = 0; i < hs; i++) xw[i] = LLM_YL[i];
 }
+
+void att_head_hw(RunState *s, const Config *p, int h, int pos, float sqrt_hs,
+                 uint32_t k_addr, uint32_t v_addr);
+
+void att_head(RunState *s, const Config *p, int l, int h, int kvh, int pos, float sqrt_hs) {
+    att_head_hw(s, p, h, pos, sqrt_hs, k_addr(p, l, kvh), v_addr(p, l, kvh));
+}

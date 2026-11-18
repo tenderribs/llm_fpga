@@ -67,6 +67,15 @@ void att_store_kv(RunState *s, const Config *p, int l, int pos);
 void att_scores(RunState *s, const Config *p, int l, int kvh, const float *q, float *att, int nt);
 void att_wsum(RunState *s, const Config *p, int l, int kvh, const float *att, float *xb, int nt);
 
+// The work around the matmuls, as weak defaults on the CPU (model.c) a
+// platform can override with the same results: mm_quant quantizes the next
+// matmuls' input; att_head is one head's attention (scores, scaling,
+// softmax, weighted sum into s->xb); ffn_hidden is w1 and w3, SwiGLU and
+// the quantize for w2 (into s->hq).
+void mm_quant(QTensor *qx, const float *x, int n, int gs);
+void att_head(RunState *s, const Config *p, int l, int h, int kvh, int pos, float sqrt_hs);
+void ffn_hidden(const Model *m, RunState *s, int l);
+
 // With MODEL_PROFILE, forward() adds the cycles of each part to prof_cycles
 // (prof_now() from the platform).
 enum { PROF_NORM, PROF_QUANT, PROF_MM, PROF_ROPE, PROF_ATT, PROF_FFN, PROF_N };

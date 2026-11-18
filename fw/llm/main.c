@@ -37,18 +37,33 @@ void *fast_calloc(size_t n, size_t size) {
     return p;
 }
 
-void qmatmul(float *y, const QTensor *x, uint32_t w_off, int n, int d) {
+// qmv's x RAM holds this tensor: put there by the vector unit (mm_quant,
+// ffn_hidden in vpu_hw.c), so qmatmul doesn't write it again
+const QTensor *g_xram;
+
+// run a matmul of what the x RAM holds; results to Y from word yoff
+void mm_run(uint32_t w_off, int n, int d, int yoff) {
     uint32_t t0 = LLM_CYCLES;
-    const uint32_t *xq = (const uint32_t *)x->q;  // calloc'd: word aligned
-    const uint32_t *xs = (const uint32_t *)x->s;
-    for (int i = 0; i < n / 4; i++) LLM_XQ[i] = xq[i];
-    for (int g = 0; g < n / 32; g++) LLM_XS[g] = xs[g];
+    LLM_MM_YOFF = (uint32_t)yoff;
     LLM_MM_ADDR = w_off;
     LLM_MM_ND = (uint32_t)n | ((uint32_t)d << 16);
     LLM_MM_START = 1;
     while (LLM_STATUS & ST_MM_BUSY) {}
+    g_mm_cycles += LLM_CYCLES - t0;
+}
+
+void qmatmul(float *y, const QTensor *x, uint32_t w_off, int n, int d) {
+    if (x != g_xram) {
+        const uint32_t *xq = (const uint32_t *)x->q;  // calloc'd: word aligned
+        const uint32_t *xs = (const uint32_t *)x->s;
+        for (int i = 0; i < n / 4; i++) LLM_XQ[i] = xq[i];
+        for (int g = 0; g < n / 32; g++) LLM_XS[g] = xs[g];
+        g_xram = x;
+    }
+    mm_run(w_off, n, d, 0);
     // the classifier's logits are only needed for the trace: the next token
     // comes from the hardware argmax
+    uint32_t t0 = LLM_CYCLES;
     if (d != g_vocab || g_keep_logits) {
         uint32_t *yw = (uint32_t *)y;
         for (int i = 0; i < d; i++) yw[i] = LLM_YL[i];
