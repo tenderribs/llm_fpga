@@ -2,9 +2,9 @@
 
 This document describes the whole system: what runs where, how data and
 control move, the clocks, the memories, the boot, how correctness is
-checked, and where the time goes. For how each RTL unit works inside, see
-the [README](../README.md#architecture) and the comments at the top of each
-source file.
+checked, and where the time goes. For how each unit works inside, see the
+pages in [hardware/](README.md#all-pages) and the comments at the top of
+each source file.
 
 All numbers are for stories15M (int8 Q8_0, greedy decoding) on the board,
 measured on 2026-11-18 unless noted otherwise.
@@ -288,7 +288,8 @@ Each step adds RTL and verification effort for a diminishing return. The
 design is within about 2× of what this memory system allows. A clearly
 bigger gain needs more memory bandwidth, which this board doesn't have.
 
-**About the 256-token figures.** The README's speed history uses fixed
+**About the 256-token figures.** The speed history in
+[performance.md](performance.md#speed-history) uses fixed
 256-token runs with `--trace`. Tracing copies all 32,000 logits out of the
 Y RAM every token to hash them, about 1.3 ms counted under "matmul". It also
 reads a longer KV cache. Those runs show 132 tokens/s (7.6 ms per token)
@@ -413,9 +414,16 @@ section 9. Each one costs a new unit or sequencer and its verification.
 
 **Better uses of the effort:**
 - **Bigger models.** stories42M (47 MB of weights per token) and
-  stories110M (123 MB) fit the card and DDR3, and the units' RAMs are sized
-  for them. Neither has been run yet. Time scales roughly with the weight
-  bytes, so expect about 60 and 25 tokens/s.
+  stories110M (123 MB) fit the card and DDR3, and the units' RAMs are large
+  enough. Neither has been run yet, and they need one change first. Their
+  dims are multiples of 64, so llama2.c's export uses group size 64. The
+  build has `GS` = 32, and `model_open` rejects anything else. The simple
+  route is to export them with group size 32 (`ref/export_q80.py
+  --group-size 32`): `runq.c` reads any group size. Group size 64 would need changes in more than one place. `qmv`
+  supports it and passes its group-size-64 test, but the vector unit's
+  QUANT and the firmware assume groups of 32.
+  Time scales roughly with the weight bytes, so expect about 60 and 25
+  tokens/s.
 - **Prompt processing in batches.** It would reuse each weight beat across
   several tokens. This is the one way around the bandwidth limit, but it
   only helps the prompt, not generation.
