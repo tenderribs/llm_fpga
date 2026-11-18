@@ -31,6 +31,12 @@
 #define LLM_VPU_SRC2    REG(0x0005C)
 #define LLM_VPU_DST     REG(0x00060)
 #define LLM_VPU_F       REG(0x00064)
+#define LLM_DMA_SRC     REG(0x00068)   // DMA V -> DDR: first V word
+#define LLM_DMA_N       REG(0x0006C)   // words
+#define LLM_DMA_DST     REG(0x00070)   // DDR byte address
+#define LLM_DMA_STRIDE  REG(0x00074)   // 4: whole beats, else one word per write
+#define LLM_DMA_START   REG(0x00078)
+#define VPU_COPY        0u            // V -> the attention unit's A RAM
 #define VPU_QUANT       1u
 #define VPU_SILU        2u
 #define VPU_SOFTMAX     3u
@@ -42,7 +48,7 @@
 // the same Y RAM on the local memory bus: a few cycles per read instead of
 // a round trip through the interconnect
 #define LLM_YL          ((const volatile uint32_t *)0x00100000u)
-// the vector unit's V RAM (4096 words), read / write on the local memory bus
+// the vector unit's V RAM (8192 words), read / write on the local memory bus
 #define LLM_VL          ((volatile uint32_t *)0x00120000u)
 
 #define ST_CALIB        (1u << 0)

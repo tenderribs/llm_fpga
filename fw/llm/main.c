@@ -102,6 +102,8 @@ static void generate(const Model *m, Tokenizer *tok, RunState *s, const char *pr
     g_keep_logits = trace;
     g_mm_cycles = 0;
     memset(prof_cycles, 0, sizeof(prof_cycles));
+    extern uint64_t g_kv_cycles;
+    g_kv_cycles = 0;
     uint64_t total = 0;
     int token = prompt_tokens[0], pos = 0, argmax_mismatch = 0;
     uint32_t t0 = LLM_CYCLES;
@@ -126,12 +128,14 @@ static void generate(const Model *m, Tokenizer *tok, RunState *s, const char *pr
         t0 = LLM_CYCLES;
     }
     double secs = (double)total / CLK_HZ;
+    extern uint64_t g_kv_cycles;
     double per = 1e3 / CLK_HZ / pos;
     uint64_t parts = g_mm_cycles + prof_cycles[PROF_ATT] + prof_cycles[PROF_NORM] +
                      prof_cycles[PROF_QUANT] + prof_cycles[PROF_ROPE] + prof_cycles[PROF_FFN];
     printf("\n\n[%d tokens in %.2f s: %.1f tok/s; ms per token: matmul %.1f, attention %.1f, "
-           "quantize %.1f, swiglu %.1f, rmsnorm %.1f, rope %.1f, other %.1f]\n", pos, secs,
-           pos / secs, g_mm_cycles * per, prof_cycles[PROF_ATT] * per,
+           "(kv store %.2f), quantize %.1f, swiglu %.1f, rmsnorm %.1f, rope %.1f, other %.1f]\n",
+           pos, secs,
+           pos / secs, g_mm_cycles * per, prof_cycles[PROF_ATT] * per, g_kv_cycles * per,
            prof_cycles[PROF_QUANT] * per, prof_cycles[PROF_FFN] * per,
            prof_cycles[PROF_NORM] * per, prof_cycles[PROF_ROPE] * per, (total - parts) * per);
     if (trace) {
