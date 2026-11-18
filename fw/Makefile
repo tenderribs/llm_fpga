@@ -17,7 +17,7 @@ ARCH    := -march=rv32imf_zicsr -mabi=ilp32f
 # the FPU instruction (correctly rounded, like newlib's slow software one)
 CFLAGS  := $(ARCH) -O2 -g -Wall -Wextra -ffp-contract=off -fno-math-errno -ffunction-sections -fdata-sections \
            -Icommon
-LDFLAGS  = $(ARCH) -nostartfiles -T common/link.ld  \
+LDFLAGS  = $(ARCH) -nostartfiles -T common/link.ld -Wl,--build-id=none \
            -Wl,--gc-sections -Wl,-Map,$@.map
 
 COMMON  := common/start.S common/syscalls.c
