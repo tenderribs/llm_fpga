@@ -101,14 +101,14 @@ static void generate(const Model *m, Tokenizer *tok, RunState *s, const char *pr
             trace_buf[2 * pos] = (uint32_t)next;
             trace_buf[2 * pos + 1] = trace_hash(logits, m->c.vocab_size);
         }
+        if (next == 1 && !trace) {  // BOS: the story is over (not printed, like runq.c)
+            pos++;
+            break;
+        }
         fputs(printable(decode(tok, token, next)), stdout);
         fflush(stdout);
         token = next;
         t0 = LLM_CYCLES;
-        if (next == 1 && !trace) {  // BOS: the story is over
-            pos++;
-            break;
-        }
     }
     double secs = (double)total / CLK_HZ;
     printf("\n\n[%d tokens in %.2f s: %.1f tok/s; ms per token: matmul %.1f, attention %.1f, "
