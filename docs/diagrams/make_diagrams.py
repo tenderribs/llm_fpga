@@ -227,8 +227,8 @@ class Diagram:
 # =============================================================================
 def system():
     d = Diagram("system", 1300, 700)
-    d.box("host", 20, 250, 160, 150, ["Host PC", "host/*.py, llm_host", "xsdb (firmware)",
-                                      "Vivado (bitstream)"], color="gray")
+    d.box("host", 20, 250, 160, 150, ["Host PC", "host/chat.py: prompts", "host/image_tool.py:",
+                                      "model image", "Vivado / xsdb"], color="gray")
     d.group("fpga", 210, 20, 900, 560, "Kintex-7 XC7K325T: top_soc", color="none")
 
     # CPU subsystem
@@ -238,7 +238,7 @@ def system():
                                       "8 KB I-cache", "32 KB D-cache (write-back)"],
           color="purple")
     d.box("lmb", 450, 110, 120, 100, ["Local memory", "256 KB block RAM", "firmware, stack,",
-                                      "hot buffers"], color="purple")
+                                      "hot buffers (LMB)"], color="purple")
     d.box("mdm", 250, 235, 170, 55, ["Debug module", "JTAG: load / debug"], color="purple")
     d.box("clk", 460, 235, 110, 55, ["Clocking wizard", "225 -> 150 MHz"], color="purple")
 
@@ -248,17 +248,17 @@ def system():
     # llm_core
     d.group("core", 630, 60, 460, 350, "llm_core, 225 MHz", color="green",
             subtitle="src/sources/llm_core.sv")
-    d.box("uart", 650, 115, 150, 55, ["UART commands", "3 Mbaud, + console"], color="green")
+    d.box("uart", 650, 115, 150, 55, ["UART commands", "+ console in / out"], color="green")
     d.box("regs", 650, 185, 150, 55, ["CPU registers", "AXI4-Lite"], color="green")
     d.box("sdc", 650, 255, 150, 55, ["microSD controller", "SPI mode, boot load"],
           color="green")
     d.box("axim", 650, 330, 150, 55, ["AXI4 master", "256-bit, to DDR3"], color="green")
-    d.box("qmv", 830, 115, 240, 55, ["int8 matmul engine (qmv)", "Q8_0, 32 MACs / cycle"],
-          color="green")
+    d.box("qmv", 830, 115, 240, 55, ["int8 matmul engine (qmv)",
+                                     "Q8_0, 32 MACs / cycle, + argmax"], color="green")
     d.box("attn", 830, 185, 240, 55, ["fp32 attention unit (attn)",
                                       "scores and weighted sum"], color="orange")
     d.box("rdr", 830, 255, 115, 55, ["DDR reader", "weights, K, V"], color="green")
-    d.box("yram", 955, 255, 115, 55, ["Y RAM", "32K results"], color="green")
+    d.box("yram", 955, 255, 115, 55, ["Y RAM", "results, 2 ports"], color="green")
 
     d.box("mig", 230, 450, 860, 55, ["DDR3 controller (MIG)",
                                      "1800 MT/s, 256-bit AXI, 225 MHz user clock"],
@@ -267,6 +267,8 @@ def system():
     d.box("ddr", 400, 620, 250, 55, ["DDR3, 1 GB", "model image, heap, KV cache"],
           color="blue")
     d.box("sd", 1150, 255, 130, 55, ["microSD card", "model image"], color="gray")
+    d.box("flash", 20, 610, 170, 65, ["QSPI flash, 32 MB", "bitstream with the", "firmware built in"],
+          color="gray")
 
     # edges
     d.edge("host", "uart", exit=(0.5, 0), entry=(0.9, 0), points=[(100, 10), (785, 10)],
@@ -289,6 +291,12 @@ def system():
     d.edge("sdc", "sd", exit=(1, 0.9), entry=(0, 0.5), points=[(815, 304.5), (815, 420),
                                                                (1125, 420), (1125, 282.5)],
            label="SPI", label_at=(1125, 350), label_w=30)
+    # the CPU reads results straight from the Y RAM over its local memory bus
+    d.edge("yram", "lmb", exit=(1, 0.5), entry=(0.5, 0), points=[(1100, 282.5), (1100, 45),
+                                                                 (510, 45)],
+           label="LMB: results at local-memory speed", label_at=(930, 45))
+    d.edge("flash", "fpga", exit=(1, 0.5), entry=(90 / 900, 1), points=[(300, 642.5)],
+           label=["configuration", "at power-on"], label_at=(250, 600), label_w=80)
     d.write()
 
 
@@ -316,10 +324,15 @@ def core():
     d.box("attn", 960, 260, 220, 100, ["attn: fp32 attention", "A RAM (q or a)",
                                        "1 multiply-add / cycle", "16 or hs sums in flight"],
           color="orange")
-    d.box("regs", 220, 430, 200, 90, ["CPU registers", "AXI4-Lite: MM_*, AT_*, STATUS,",
-                                      "XQ / XS / AT_A windows", "Y window"], color="green")
-    d.box("yram", 960, 440, 220, 50, ["Y RAM, 32K words", "results of CPU jobs"],
+    d.box("regs", 220, 430, 200, 90, ["CPU registers", "AXI4-Lite: MM_*, AT_*, ARGMAX,",
+                                      "CONSOLE (out / in), XQ / XS /", "AT_A windows, Y window"],
           color="green")
+    d.box("yram", 960, 440, 220, 50, ["Y RAM, 32K words", "results of CPU jobs; argmax"],
+          color="green")
+    d.box("lmbp", 690, 520, 200, 45, ["CPU local memory bus", "(LMB, 150 MHz clock)"],
+          color="purple")
+    d.box("cin", 220, 330, 200, 60, ["Console input FIFO", "prompt bytes for the CPU"],
+          color="gray")
     d.box("yfifo", 960, 560, 220, 50, ["Result FIFO", "results of UART matmuls"],
           color="gray")
     d.box("cons", 220, 580, 200, 50, ["Console FIFO", "CPU text, between commands"],
@@ -359,7 +372,13 @@ def core():
     d.edge("yfifo", "tx", exit=(0.5, 1), entry=(0.5, 1), points=[(1070, 660), (105, 660)],
            label="matmul results", label_at=(600, 660))
     d.edge("fsm", "tx", exit=(0, 0.8), entry=(1, 0.2), points=[(195, 189), (195, 590)],
-           label=["replies,", "READ data"], label_at=(130, 400), label_w=62)
+           label=["replies,", "READ data"], label_at=(195, 545), label_w=62)
+    d.edge("rx", "cin", exit=(0.5, 1), entry=(0, 0.5), points=[(105, 360)],
+           label=["CONSOLE_IN", "command"], label_at=(105, 280), label_w=72)
+    d.edge("cin", "regs", exit=(0.25, 1), entry=(0.25, 0), label="CONSOLE_IN",
+           label_at=(270, 410), label_w=72)
+    d.edge("yram", "lmbp", exit=(0.2, 1), entry=(1, 0.5), points=[(1004, 542.5)],
+           label="2nd port", label_at=(1004, 520), label_w=56)
     d.write()
 
 
@@ -400,8 +419,9 @@ def token():
     # row 3: classifier
     d.box("nf", 160, y3, 140, h, ["Final RMSNorm", "+ quantize"], color="purple")
     d.box("cls", 330, y3, 170, h, ["Classifier matmul", "32000 logits"], color="green")
-    d.box("am", 530, y3, 140, h, ["Argmax", "next token"], color="purple")
-    d.box("tok", 700, y3, 150, h, ["Tokenizer", "decode, print", "(UART console)"],
+    d.box("am", 530, y3, 140, h, ["Argmax", "in hardware, as the", "logits come out"],
+          color="green")
+    d.box("tok", 700, y3, 150, h, ["Tokenizer", "decode, print to", "host/chat.py"],
           color="purple")
     d.box("w", 900, y3 - 10, 280, 90, ["Weights: qmv DDR format", "streamed by the engine,",
                                        "17 MB per token (stories15M)", "KV cache: read by the unit"],
@@ -421,8 +441,11 @@ def token():
            label="after the last layer", label_at=(230, 420), label_w=120)
     for a, b in [("nf", "cls"), ("cls", "am"), ("am", "tok")]:
         d.edge(a, b)
-    d.text("note", 20, 570, 1160, 34,
-           ["The float operations are runq.c's, in runq.c's order (no FMA): the board's logits are "
+    d.text("note", 20, 565, 1160, 40,
+           ["The prompt comes from host/chat.py over the UART; the CPU encodes it and feeds its "
+            "tokens through forward() before generating. The CPU reads every result over its local "
+            "memory bus.",
+            "The float operations are runq.c's, in runq.c's order (no FMA): the board's logits are "
             "bit-identical to the x86 build of the same firmware."], size=11, bg=False)
     d.write()
 
@@ -437,6 +460,8 @@ def memory():
            size=13, bold=True, bg=False)
     rows = [
         ("0x0000_0000", "Local memory, 256 KB", "firmware, stack, hot buffers (LMB)", "purple", 60),
+        ("0x0010_0000", "llm_core's result RAM (Y), 128 KB",
+         "on the local memory bus too: fast reads", "green", 50),
         ("0x4000_0000", "llm_core registers, 256 KB", "uncached (AXI4-Lite)", "green", 60),
         ("0x8000_0000", "DDR3, cached (512 MB)", "model image, heap", "blue", 130),
         ("0xA000_0000", "DDR3, uncached (512 MB)", "KV cache (shared with the unit)", "blue", 130),
@@ -470,12 +495,17 @@ def memory():
         hh = 36 if i < 4 else 52
         d.box(f"p{i}", 715, py, 410, hh, [p], color=col, size=11, title_bold=False)
         py += hh + 6
-    d.text("sd", 700, 505, 440, 40,
+    d.text("sd", 700, 505, 440, 54,
            ["The image is stored on the microSD card and copied to DDR3 offset 0",
-            "at power-on; host/image_tool.py uploads it over the UART."], size=11, bg=False)
-    d.edge("m2", "d0", exit=(1, 0.3), entry=(0, 0.2), points=[(560, 249), (560, 100)],
+            "at power-on; host/image_tool.py uploads it over the UART.",
+            "The QSPI flash holds the bitstream, with the firmware in the local memory."],
+           size=11, bg=False)
+    m3, m4 = d.ids["m3"], d.ids["m4"]
+    y3 = m3["y"] + m3["h"] * 0.3
+    y4 = m4["y"] + m4["h"] * 0.3
+    d.edge("m3", "d0", exit=(1, 0.3), entry=(0, 0.2), points=[(560, y3), (560, 100)],
            dashed=True)
-    d.edge("m3", "d2", exit=(1, 0.3), entry=(0, 0.5), points=[(580, 399), (580, 455)],
+    d.edge("m4", "d2", exit=(1, 0.3), entry=(0, 0.5), points=[(580, y4), (580, 455)],
            dashed=True)
     d.write()
 
