@@ -13,6 +13,9 @@
 //   6. CPU side over AXI4-Lite: ID, console output on the UART, and the
 //      first matmul again with x written through the XQ / XS windows and
 //      every result read back from the Y RAM
+//   7. attention through the CPU registers (sim/gen_attn.py vectors s48_37
+//      and w48_37): K / V loaded into the memory model, q / a through AT_A,
+//      scores and weighted sum read back from Y, bit-exact
 // The boot-time SD_LOAD (blank card: error 8) is checked through STATUS.
 module tb_llm_core #(
     parameter string VecDir0,  // first matmul vectors
@@ -21,6 +24,8 @@ module tb_llm_core #(
     parameter string VecDir1,  // second matmul vectors
     parameter int N1,
     parameter int D1,
+    parameter string VecDirAttS,  // attention scores vectors (hs 48, nt 37)
+    parameter string VecDirAttW,  // attention weighted-sum vectors (hs 48, nt 37)
     parameter int GS = 32
 ) ();
 
@@ -480,6 +485,38 @@ module tb_llm_core #(
       errors += errs;
     end
 
+    // 7. attention: scores (K at byte 0x180000), then weighted sum (V at 0x1A0000)
+    for (int mode = 0; mode < 2; mode++) begin
+      localparam int HsA = 48, NtA = 37;
+      logic [31:0] v;
+      logic [31:0] a_vals[HsA > NtA ? HsA : NtA];
+      logic [255:0] kv[3 * HsA * 2];
+      logic [31:0] y_att[48];
+      int nbeats = mode ? NtA * HsA / 8 : 3 * HsA * 2;
+      int base_word = mode ? 32'h1A0000 / 32 : 32'h180000 / 32;
+      int errs = 0;
+      string dir = mode ? VecDirAttW : VecDirAttS;
+      $readmemh({dir, "/a.hex"}, a_vals);
+      $readmemh({dir, "/beats.hex"}, kv);
+      $readmemh({dir, "/y.hex"}, y_att);
+      for (int b = 0; b < nbeats; b++) u_mem.mem[base_word+b] = kv[b];
+      for (int i = 0; i < (mode ? NtA : HsA); i++) axil_write(18'h04000 + 18'(i * 4), a_vals[i]);
+      axil_write(18'h00030, 32'(base_word * 32));
+      axil_write(18'h00034, {16'(NtA), 16'(HsA)});
+      axil_write(18'h00038, 32'(mode));
+      do axil_read(18'h00004, v); while (v[8]);
+      for (int i = 0; i < 48; i++) begin
+        axil_read(18'h20000 + 18'(i * 4), v);
+        if (v !== y_att[i]) begin
+          if (errs < 5) $display("MISMATCH attention mode %0d y[%0d]: got %08h, exp %08h", mode, i, v, y_att[i]);
+          errs++;
+        end
+      end
+      $display("attention mode %0d (hs %0d, %0d timesteps) through the registers: %0d mismatches",
+               mode, HsA, NtA, errs);
+      errors += errs;
+    end
+
     repeat (100) @(posedge clk);
     if (rx_bytes.size() != 0) begin
       $display("MISMATCH %0d extra reply bytes", rx_bytes.size());
@@ -493,8 +530,8 @@ module tb_llm_core #(
       $display("MISMATCH %0d SD protocol errors", u_card.errors);
       errors++;
     end
-    if (led[7:4] !== 4'd5) begin
-      $display("MISMATCH job LEDs %0d, exp 5", led[7:4]);
+    if (led[7:4] !== 4'd7) begin
+      $display("MISMATCH job LEDs %0d, exp 7", led[7:4]);
       errors++;
     end
 

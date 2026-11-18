@@ -56,6 +56,16 @@ void *fast_calloc(size_t n, size_t size);
 float *forward(const Model *m, RunState *s, int token, int pos);
 int sample_argmax(const float *p, int n);
 
+// Attention for layer l, KV head kvh, timesteps 0..nt-1. The defaults
+// (model.c) run on the CPU over the run state's KV cache; a platform can
+// override them (weak symbols), with the same float operations in the same
+// order. att_store_kv saves s->k / s->v for position pos; att_scores writes
+// the raw scores q.k_t (unscaled); att_wsum writes xb = sum over t of
+// att[t] * v_t, starting from 0.
+void att_store_kv(RunState *s, const Config *p, int l, int pos);
+void att_scores(RunState *s, const Config *p, int l, int kvh, const float *q, float *att, int nt);
+void att_wsum(RunState *s, const Config *p, int l, int kvh, const float *att, float *xb, int nt);
+
 // With MODEL_PROFILE, forward() adds the cycles of each part to prof_cycles
 // (prof_now() from the platform).
 enum { PROF_NORM, PROF_QUANT, PROF_MM, PROF_ROPE, PROF_ATT, PROF_FFN, PROF_N };

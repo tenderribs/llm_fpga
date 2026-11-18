@@ -11,6 +11,9 @@
 // base_i must be 4 KB aligned: bursts are BurstBeats long and must not cross
 // a 4 KB boundary.
 //
+// With raw_i at start, the beats are passed on as they are (no scale beats;
+// w_s_o unused): K / V for the attention unit.
+//
 // Reads run ahead of qmv by up to FifoDepth beats; an AR burst is only issued
 // when the FIFO is sure to have room for all of it, so R is always ready.
 // abort_i stops new bursts; bursts already issued are still received and
@@ -24,9 +27,10 @@ module wstream_reader #(
     input wire logic rst_ni,
 
     input wire logic start_i,
+    input wire logic raw_i,
     input wire logic abort_i,
     input wire logic [AddrW-1:0] base_i,
-    input wire logic [31:0] axi_beats_i,  // AXI beats to read, multiple of 9
+    input wire logic [31:0] axi_beats_i,  // AXI beats to read, multiple of 9 (unless raw)
     output logic busy_o,
 
     // AXI4 read address / data
@@ -127,20 +131,25 @@ module wstream_reader #(
 
   logic [3:0] chunk_idx_q;  // 0: scale beat, 1..8: weight beats
   logic [7:0][31:0] scales_q;
+  logic raw_q;
+  logic is_scale;
+  assign is_scale = !raw_q && chunk_idx_q == 0;
 
-  assign w_valid_o = !fifo_empty && (chunk_idx_q != 0) && !stopping_q;
+  assign w_valid_o = !fifo_empty && !is_scale && !stopping_q;
   assign w_q_o = fifo_data;
   assign w_s_o = scales_q[chunk_idx_q-1];
   // the scale beat is consumed here; weight beats when qmv takes them;
   // after an abort, everything is dropped
-  assign fifo_pop = !fifo_empty && (stopping_q || chunk_idx_q == 0 || w_ready_i);
+  assign fifo_pop = !fifo_empty && (stopping_q || is_scale || w_ready_i);
 
   always_ff @(posedge clk_i, negedge rst_ni) begin
     if (~rst_ni) begin
       chunk_idx_q <= '0;
+      raw_q <= 1'b0;
     end else if (start_i && !busy_o) begin
       chunk_idx_q <= '0;
-    end else if (fifo_pop && !stopping_q) begin
+      raw_q <= raw_i;
+    end else if (fifo_pop && !stopping_q && !raw_q) begin
       chunk_idx_q <= (chunk_idx_q == 4'd8) ? 4'd0 : chunk_idx_q + 1;
     end
   end

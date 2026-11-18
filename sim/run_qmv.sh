@@ -48,9 +48,11 @@ echo "=== top_qmv over UART: mm_000 ==="
   || status=1
 
 # llm_core (UART commands, DDR weight reader, qmv) with an AXI memory model
+"$PYTHON" "$REPO/sim/gen_attn.py" "$VEC/attn" > /dev/null
 echo "=== llm_core: STATUS, WRITE/READ, matmuls from DDR ==="
 "$REPO/sim/run_tb.sh" tb_llm_core default \
   -GVecDir0="\"$VEC/mm_000\"" -GN0=288 -GD0=288 \
-  -GVecDir1="\"$VEC/mm_006\"" -GN1=768 -GD1=288 || status=1
+  -GVecDir1="\"$VEC/mm_006\"" -GN1=768 -GD1=288 \
+  -GVecDirAttS="\"$VEC/attn/s48_37\"" -GVecDirAttW="\"$VEC/attn/w48_37\"" || status=1
 
 exit $status

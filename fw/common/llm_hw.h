@@ -19,8 +19,12 @@
 #define LLM_SD_BYTES    REG(0x0001C)
 #define LLM_SD_ADDR     REG(0x00020)
 #define LLM_CYCLES      REG(0x00024)
+#define LLM_AT_ADDR     REG(0x00030)   // attention: K / V address (DDR offset)
+#define LLM_AT_CFG      REG(0x00034)   // head_size | timesteps << 16
+#define LLM_AT_START    REG(0x00038)   // 0: scores, 1: weighted sum
 #define LLM_XQ          ((volatile uint32_t *)(LLM_BASE + 0x01000))
 #define LLM_XS          ((volatile uint32_t *)(LLM_BASE + 0x01800))
+#define LLM_AT_A        ((volatile uint32_t *)(LLM_BASE + 0x04000))
 #define LLM_Y           ((volatile uint32_t *)(LLM_BASE + 0x20000))
 
 #define ST_CALIB        (1u << 0)
@@ -28,7 +32,7 @@
 #define ST_SD_OK        (1u << 2)
 #define ST_SD_ERR       (1u << 3)
 #define ST_SD_CODE(s)   (((s) >> 4) & 0xF)
-#define ST_MM_BUSY      (1u << 8)
+#define ST_MM_BUSY      (1u << 8)   // matmul or attention job
 #define ST_CONS_FULL    (1u << 9)
 
 #define CLK_HZ          225000000u  // llm_core and its CYCLES counter (DDR user clock)

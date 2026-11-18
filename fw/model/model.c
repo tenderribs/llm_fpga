@@ -114,6 +114,68 @@ static void quantize(QTensor *qx, const float *x, int n, int gs) {
     }
 }
 
+// ---- attention on the CPU, over the KV cache in the run state: the
+// default for the platform hooks (the board overrides them with the
+// attention unit). Four timesteps at a time: independent sums the CPU can
+// overlap; every sum still adds its terms in runq.c's order.
+
+__attribute__((weak)) void att_store_kv(RunState *s, const Config *p, int l, int pos) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int loff = l * p->seq_len * kv_dim;
+    memcpy(s->key_cache + loff + pos * kv_dim, s->k, kv_dim * sizeof(float));
+    memcpy(s->value_cache + loff + pos * kv_dim, s->v, kv_dim * sizeof(float));
+}
+
+__attribute__((weak)) void att_scores(RunState *s, const Config *p, int l, int kvh,
+                                      const float *q, float *att, int nt) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int head_size = p->dim / p->n_heads;
+    const float *kh = s->key_cache + l * p->seq_len * kv_dim + kvh * head_size;
+    int t = 0;
+    for (; t + 4 <= nt; t += 4) {
+        const float *k0 = kh + t * kv_dim, *k1 = k0 + kv_dim, *k2 = k1 + kv_dim,
+                    *k3 = k2 + kv_dim;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int i = 0; i < head_size; i++) {
+            s0 += q[i] * k0[i];
+            s1 += q[i] * k1[i];
+            s2 += q[i] * k2[i];
+            s3 += q[i] * k3[i];
+        }
+        att[t] = s0;
+        att[t + 1] = s1;
+        att[t + 2] = s2;
+        att[t + 3] = s3;
+    }
+    for (; t < nt; t++) {
+        const float *k = kh + t * kv_dim;
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+        att[t] = score;
+    }
+}
+
+__attribute__((weak)) void att_wsum(RunState *s, const Config *p, int l, int kvh,
+                                    const float *att, float *xb, int nt) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int head_size = p->dim / p->n_heads;
+    const float *vh = s->value_cache + l * p->seq_len * kv_dim + kvh * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    int t = 0;
+    for (; t + 4 <= nt; t += 4) {
+        const float *v0 = vh + t * kv_dim, *v1 = v0 + kv_dim, *v2 = v1 + kv_dim,
+                    *v3 = v2 + kv_dim;
+        float a0 = att[t], a1 = att[t + 1], a2 = att[t + 2], a3 = att[t + 3];
+        for (int i = 0; i < head_size; i++)
+            xb[i] = (((xb[i] + a0 * v0[i]) + a1 * v1[i]) + a2 * v2[i]) + a3 * v3[i];
+    }
+    for (; t < nt; t++) {
+        const float *v = vh + t * kv_dim;
+        float a = att[t];
+        for (int i = 0; i < head_size; i++) xb[i] += a * v[i];
+    }
+}
+
 float *forward(const Model *m, RunState *s, int token, int pos) {
     const Config *p = &m->c;
     float *x = s->x;
@@ -158,59 +220,16 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         PROF_END(PROF_ROPE);
         }
 
-        int loff = l * p->seq_len * kv_dim;
         {
         PROF_BEGIN();
-        memcpy(s->key_cache + loff + pos * kv_dim, s->k, kv_dim * sizeof(float));
-        memcpy(s->value_cache + loff + pos * kv_dim, s->v, kv_dim * sizeof(float));
-
-        // Four timesteps at a time: independent sums the CPU can overlap.
-        // Every sum still adds its terms in runq.c's order, so the results
-        // are the same bits.
+        att_store_kv(s, p, l, pos);
         float sqrt_hs = sqrtf(head_size);
         for (int h = 0; h < p->n_heads; h++) {
-            const float *q = s->q + h * head_size;
             float *att = s->att + h * p->seq_len;
-            const float *kh = s->key_cache + loff + (h / kv_mul) * head_size;
-            int t = 0;
-            for (; t + 3 <= pos; t += 4) {
-                const float *k0 = kh + t * kv_dim, *k1 = k0 + kv_dim, *k2 = k1 + kv_dim,
-                            *k3 = k2 + kv_dim;
-                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    s0 += q[i] * k0[i];
-                    s1 += q[i] * k1[i];
-                    s2 += q[i] * k2[i];
-                    s3 += q[i] * k3[i];
-                }
-                att[t] = s0 / sqrt_hs;
-                att[t + 1] = s1 / sqrt_hs;
-                att[t + 2] = s2 / sqrt_hs;
-                att[t + 3] = s3 / sqrt_hs;
-            }
-            for (; t <= pos; t++) {
-                const float *k = kh + t * kv_dim;
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) score += q[i] * k[i];
-                att[t] = score / sqrt_hs;
-            }
+            att_scores(s, p, l, h / kv_mul, s->q + h * head_size, att, pos + 1);
+            for (int t = 0; t <= pos; t++) att[t] = att[t] / sqrt_hs;
             softmax(att, pos + 1);
-            float *xb = s->xb + h * head_size;
-            const float *vh = s->value_cache + loff + (h / kv_mul) * head_size;
-            memset(xb, 0, head_size * sizeof(float));
-            t = 0;
-            for (; t + 3 <= pos; t += 4) {
-                const float *v0 = vh + t * kv_dim, *v1 = v0 + kv_dim, *v2 = v1 + kv_dim,
-                            *v3 = v2 + kv_dim;
-                float a0 = att[t], a1 = att[t + 1], a2 = att[t + 2], a3 = att[t + 3];
-                for (int i = 0; i < head_size; i++)
-                    xb[i] = (((xb[i] + a0 * v0[i]) + a1 * v1[i]) + a2 * v2[i]) + a3 * v3[i];
-            }
-            for (; t <= pos; t++) {
-                const float *v = vh + t * kv_dim;
-                float a = att[t];
-                for (int i = 0; i < head_size; i++) xb[i] += a * v[i];
-            }
+            att_wsum(s, p, l, h / kv_mul, att, s->xb + h * head_size, pos + 1);
         }
         PROF_END(PROF_ATT);
         }
