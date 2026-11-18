@@ -161,6 +161,20 @@ int main(void) {
     printf("model: dim %d, hidden %d, %d layers, %d heads, vocab %d, seq_len %d\n", m.c.dim,
            m.c.hidden_dim, m.c.n_layers, m.c.n_heads, m.c.vocab_size, m.c.seq_len);
     if ((err = tokenizer_open(&tok, &m))) fail(err);
+    // the RMSNorm weights into local memory (read every layer)
+    {
+        int nw = (2 * m.c.n_layers + 1) * m.c.dim;
+        float *w = fast_calloc(nw, sizeof(float));
+        if (w) {
+            int L = m.c.n_layers * m.c.dim;
+            memcpy(w, m.rms_att, L * sizeof(float));
+            memcpy(w + L, m.rms_ffn, L * sizeof(float));
+            memcpy(w + 2 * L, m.rms_final, m.c.dim * sizeof(float));
+            m.rms_att = w;
+            m.rms_ffn = w + L;
+            m.rms_final = w + 2 * L;
+        }
+    }
     if (!run_state_alloc(&s, &m.c)) fail("out of memory");
     g_vocab = m.c.vocab_size;
 

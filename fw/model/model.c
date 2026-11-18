@@ -125,6 +125,19 @@ static void rmsnorm(float *o, const float *x, const float *weight, int size) {
     for (; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
 
+static void add4(float *x, const float *y, int size) {  // x[i] += y[i]
+    int i = 0;
+    for (; i + 4 <= size; i += 4) {
+        float a0 = x[i] + y[i], a1 = x[i + 1] + y[i + 1];
+        float a2 = x[i + 2] + y[i + 2], a3 = x[i + 3] + y[i + 3];
+        x[i] = a0;
+        x[i + 1] = a1;
+        x[i + 2] = a2;
+        x[i + 3] = a3;
+    }
+    for (; i < size; i++) x[i] += y[i];
+}
+
 static void div4(float *x, int size, float d) {  // x[i] /= d
     int i = 0;
     for (; i + 4 <= size; i += 4) {
@@ -332,16 +345,22 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
         // RoPE
         {
         PROF_BEGIN();
-        for (int i = 0; i < dim; i += 2) {
-            int k = (i % head_size) / 2;
-            float fcr = s->rope_cos[k], fci = s->rope_sin[k];
-            int rotn = i < kv_dim ? 2 : 1;
-            for (int v = 0; v < rotn; v++) {
-                float *vec = v == 0 ? s->q : s->k;
-                float v0 = vec[i];
-                float v1 = vec[i + 1];
-                vec[i] = v0 * fcr - v1 * fci;
-                vec[i + 1] = v0 * fci + v1 * fcr;
+        // q (dim) and k (kv_dim), head by head, two pairs at a time
+        for (int v = 0; v < 2; v++) {
+            float *vec = v == 0 ? s->q : s->k;
+            int n = v == 0 ? dim : kv_dim;
+            for (int h0 = 0; h0 < n; h0 += head_size) {
+                float *hv = vec + h0;
+                for (int k = 0; k < head_size / 2; k += 2) {
+                    float c0 = s->rope_cos[k], s0 = s->rope_sin[k];
+                    float c1 = s->rope_cos[k + 1], s1 = s->rope_sin[k + 1];
+                    float a0 = hv[2 * k], b0 = hv[2 * k + 1];
+                    float a1 = hv[2 * k + 2], b1 = hv[2 * k + 3];
+                    hv[2 * k] = a0 * c0 - b0 * s0;
+                    hv[2 * k + 1] = a0 * s0 + b0 * c0;
+                    hv[2 * k + 2] = a1 * c1 - b1 * s1;
+                    hv[2 * k + 3] = a1 * s1 + b1 * c1;
+                }
             }
         }
         PROF_END(PROF_ROPE);
@@ -357,14 +376,14 @@ float *forward(const Model *m, RunState *s, int token, int pos) {
 
         PROF(PROF_QUANT, mm_quant(&s->xq, s->xb, dim, gs));
         PROF(PROF_MM, qmatmul(s->xb2, &s->xq, model_mat(m, l, MAT_WO), dim, dim));
-        for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
+        add4(x, s->xb2, dim);
 
         PROF(PROF_NORM, rmsnorm(s->xb, x, m->rms_ffn + l * dim, dim));
 
         PROF(PROF_QUANT, mm_quant(&s->xq, s->xb, dim, gs));
         ffn_hidden(m, s, l);
         PROF(PROF_MM, qmatmul(s->xb, &s->hq, model_mat(m, l, MAT_W2), hidden_dim, dim));
-        for (int i = 0; i < dim; i++) x[i] += s->xb[i];
+        add4(x, s->xb, dim);
     }
 
     PROF(PROF_NORM, rmsnorm(x, x, m->rms_final, dim));
