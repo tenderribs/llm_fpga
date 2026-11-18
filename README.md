@@ -271,7 +271,24 @@ grep '^T ' run.txt | diff - golden.txt   # identical
 board's QSPI flash (erasing what was there). With the mode jumper on QSPI,
 the board then boots by itself at power-on: it configures from the flash,
 loads the model from the microSD card (~7 s) and waits for prompts from
-`host/chat.py`.
+`host/chat.py`. The flash now holds this design (written 2026-11-18). After
+writing, the FPGA was rebooted from the flash over JTAG and worked; a boot
+from an actual power cycle has not been tried yet.
+
+## Status and next steps
+
+Measured on the board (stories15M, greedy, `host/chat.py`): 31-38 tokens/s
+for a full story; the time per token is about 17 ms of float work on the
+CPU (quantize 6.7, SwiGLU 6.7, RoPE 3), 5 ms of matmuls and 4-13 ms of
+attention (growing with the story's length).
+
+- [ ] Power-on boot from the QSPI flash (needs a power cycle on site; the
+      mode jumper must be on QSPI)
+- [ ] RoPE: its sin / cos depend only on the position, so compute them once
+      per token instead of in every layer (same bits)
+- [ ] Quantize and SwiGLU (divisions and `expf`) in hardware, or several
+      elements at a time on the CPU
+- [ ] Bigger models: stories42M, stories110M (the microSD card has room)
 
 Other firmware (`make -C fw`) is loaded over JTAG onto a running `top_soc`
 (`make TOP=top_soc program`): `xsdb scripts/run_fw.tcl fw/build/bringup.elf`
