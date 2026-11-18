@@ -27,6 +27,9 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fp_ref  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ref"))
 import q80  # noqa: E402
 
@@ -115,7 +118,35 @@ def gen_fp(outdir: Path, count: int):
     i32 = i.astype(np.int32)
     write_vec(outdir / "i2f.hex", [i32.view(np.uint32), bits(i32.astype(f32))])
 
-    for name in ["add", "mul", "i2f"]:
+    # --- div
+    a = rand_floats(rng, count, 70, 185)
+    b = rand_floats(rng, count, 70, 185)
+    a[:q] = short_mantissa(rng, q, 12)
+    b[:q] = short_mantissa(rng, q, 6)
+    # quantize-like (x / (max / 127)) and softmax-like (e / sum) operands
+    a[q:2 * q] = rng.standard_normal(q).astype(f32)
+    b[q:2 * q] = (np.abs(rng.standard_normal(q)) / f32(127) + f32(1e-3)).astype(f32)
+    a[2 * q:3 * q] = rng.random(q).astype(f32)
+    b[2 * q:3 * q] = (rng.random(q) * 50 + 1).astype(f32)
+    special = [(1.0, 3.0), (2.0, 1.0), (-1.0, 3.0), (0.0, 5.0), (-0.0, 5.0), (1.0, 1.0),
+               (1.0 - 2.0 ** -24, 1.0), (1.0, 1.0 - 2.0 ** -24), (7.0, 7.0), (5.0, 0.0)]
+    a = np.concatenate([a, f32([s[0] for s in special])])
+    b = np.concatenate([b, f32([s[1] for s in special])])
+    with np.errstate(all="ignore"):
+        y = a / b
+    keep = is_normal_or_zero(a) & is_normal_or_zero(b) & (is_normal_or_zero(y) | np.isinf(y))
+    write_vec(outdir / "div.hex", [bits(a[keep]), bits(b[keep]), bits(y[keep])])
+
+    # --- exp (the firmware's m_expf), results that aren't subnormal
+    x = np.concatenate([rng.uniform(-110, 95, count // 2), rng.uniform(-2, 2, count // 4),
+                        rng.uniform(-87.3, -80, count // 8),
+                        [0, -0.0, 88.7228394, 88.72284, -103.972084, -103.97209, -87.0, 1.0]])
+    x = x.astype(f32)
+    y = fp_ref.m_expf(x)
+    keep = is_normal_or_zero(y) | np.isinf(y)
+    write_vec(outdir / "exp.hex", [bits(x[keep]), bits(y[keep])])
+
+    for name in ["add", "mul", "i2f", "div", "exp"]:
         n = sum(1 for _ in open(outdir / f"{name}.hex"))
         print(f"{name}: {n} vectors")
 

@@ -25,7 +25,8 @@ echo "=== fp32 units ==="
 "$PYTHON" "$REPO/sim/gen_qmv.py" fp "$VEC/fp" > /dev/null
 "$REPO/sim/run_tb.sh" tb_fp32 default -GVecDir="\"$VEC/fp\"" \
   -GNumAdd="$(wc -l < "$VEC/fp/add.hex")" -GNumMul="$(wc -l < "$VEC/fp/mul.hex")" \
-  -GNumI2f="$(wc -l < "$VEC/fp/i2f.hex")" || status=1
+  -GNumI2f="$(wc -l < "$VEC/fp/i2f.hex")" -GNumDiv="$(wc -l < "$VEC/fp/div.hex")" \
+  -GNumExp="$(wc -l < "$VEC/fp/exp.hex")" || status=1
 
 # group size 64 (two beats per group), which stories15M doesn't use
 "$PYTHON" "$REPO/sim/gen_qmv.py" rand-dump "$DUMPS/mm_rand_gs64.bin" 512 256 64
